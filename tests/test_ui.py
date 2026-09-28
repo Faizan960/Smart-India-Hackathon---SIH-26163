@@ -15,6 +15,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine.attack_surface import AttackSurface, Endpoint  # noqa: E402
+from engine.baseline import build_baseline  # noqa: E402
 from engine.gate import evaluate_gate  # noqa: E402
 from engine.scorer import score_all  # noqa: E402
 from model.finding import Finding, Severity, Status  # noqa: E402
@@ -148,7 +149,15 @@ class TestDashboard(unittest.TestCase):
         gate = self.report["gate"]
         self.assertIn(gate["result"], self.html)            # the exact decision the engine made
         self.assertIn(gate["policy"], self.html)
-        self.assertIn(dashboard.GATE_MESSAGE, self.html)
+        # The headline must match the ACTUAL gate result. This fixture has a verified High
+        # finding, so the engine's decision is FAIL: the dashboard must say FAIL and must NOT
+        # show the WARN-specific copy — rendering GATE_MESSAGE here would contradict the
+        # report (a "no verified High" sentence over a verified-High FAIL). §6/§16.
+        self.assertEqual(gate["result"], "FAIL")
+        self.assertIn("The gate is FAIL", self.html)
+        self.assertNotIn(dashboard.GATE_MESSAGE, self.html)
+        # The gate frame colour follows the result (red for FAIL), not a hardcoded amber.
+        self.assertIn("gate-hero fail", self.html)
 
     def test_posture_and_manual_review_counts(self):
         for label in ("Critical", "High", "Medium", "Manual Review"):
@@ -249,6 +258,248 @@ class TestBuildUiAgainstCanonicalReport(unittest.TestCase):
             r = load_report_for_ui(path)
             landing.render_landing(r)          # must not raise (e.g. ZeroDivisionError)
             dashboard.render_dashboard(r)
+
+
+SCAN_OLD = {"timestamp": "2026-09-27T09:00:00Z", "target": "http://localhost:3000",
+            "repository": "repo", "commit": "aaa1111", "branch": "main"}
+SCAN_NEW = {"timestamp": "2026-09-28T09:00:00Z", "target": "http://localhost:3000",
+            "repository": "repo", "commit": "bbb2222", "branch": "main"}
+
+
+def _mk(tool, title, severity, status, result, endpoint=None, file=None, line=None):
+    """A minimal Finding (scored later) carrying an explicit verification result."""
+    return Finding(tool=tool, title=title, description="d", severity=severity, status=status,
+                   endpoint=endpoint, file=file, line=line,
+                   verification={"method": "active_probe", "probe": tool, "result": result,
+                                 "rationale": "r", "timestamp": "t"})
+
+
+def _surface(paths):
+    """An AttackSurface over the given endpoint paths (drives the surface add/remove diff)."""
+    return AttackSurface(
+        endpoints=[Endpoint(path=p, methods=["GET"], source_file="api" + p.replace("/", "_") + ".ts",
+                            component="core", authentication="public", risk_tags=["rpc"])
+                   for p in paths],
+        integrations=[], env_references=[], notes=["static, read-only"])
+
+
+def _baseline_aware_report():
+    """Two REAL assessments (baseline + current) whose engine-computed diff exercises the
+    change axes: a new finding, a resolved finding, an unchanged finding, and severity /
+    score / verification / lifecycle transitions on shared fingerprints, plus a surface
+    add and remove. Built via build_report + build_baseline so field names never drift."""
+    old = score_all([
+        _mk("cors", "CORS wildcard", Severity.HIGH, Status.NEEDS_MANUAL_REVIEW, "inconclusive",
+            endpoint="http://localhost:3000/api/a"),
+        _mk("headers", "CSP header missing", Severity.HIGH, Status.VERIFIED, "confirmed",
+            endpoint="http://localhost:3000/api/b"),
+        _mk("rate-limit", "Rate limit unconfirmed", Severity.LOW, Status.NEEDS_MANUAL_REVIEW,
+            "inconclusive", endpoint="http://localhost:3000/api/c"),
+        _mk("npm-audit", "Vulnerable dependency lodash", Severity.MEDIUM, Status.NEEDS_MANUAL_REVIEW,
+            None, file="package.json", line=1)])
+    new = score_all([
+        _mk("cors", "CORS wildcard", Severity.HIGH, Status.NEEDS_MANUAL_REVIEW, "inconclusive",
+            endpoint="http://localhost:3000/api/a"),
+        _mk("headers", "CSP header missing", Severity.MEDIUM, Status.VERIFIED, "confirmed",
+            endpoint="http://localhost:3000/api/b"),
+        _mk("rate-limit", "Rate limit unconfirmed", Severity.LOW, Status.FALSE_POSITIVE, "refuted",
+            endpoint="http://localhost:3000/api/c"),
+        _mk("ssrf", "SSRF candidate reachable", Severity.MEDIUM, Status.NEEDS_MANUAL_REVIEW,
+            "inconclusive", endpoint="http://localhost:3000/api/d")])
+    old_r = build_report(old, SCAN_OLD, "0.1.0",
+                         attack_surface=_surface(["/api/a", "/api/b", "/api/c", "/api/x", "/api/y"]))
+    new_r = build_report(new, SCAN_NEW, "0.1.0",
+                         attack_surface=_surface(["/api/a", "/api/b", "/api/c", "/api/d", "/api/z"]),
+                         baseline=build_baseline(old_r))
+    return new_r
+
+
+def _gate_report(findings):
+    """A no-baseline report over `findings` (no execution/surface, so the gate result is
+    driven purely by the findings — used to pin the PASS / WARN / FAIL states)."""
+    r = build_report(score_all(findings), SCAN_NEW, "0.1.0")
+    r["diff"] = None
+    r["gate"] = evaluate_gate(r, None)
+    return r
+
+
+class TestDashboardRegression(unittest.TestCase):
+    """STEP 7: the regression + gate view renders ONLY from report['diff'] / report['gate']
+    (the engine is the single source of truth — the UI never recomputes a diff or a gate).
+    Covers the spec's CASE A-L: no-baseline vs a real no-changes comparison, every change
+    axis, the three gate colours, XSS-safety of change rows, and a degenerate/partial diff."""
+
+    def setUp(self):
+        # One real baseline-aware assessment drives CASE C-H (new/resolved/unchanged +
+        # severity/score/verification/lifecycle transitions + a surface add and remove).
+        self.report = _baseline_aware_report()
+        self.diff = self.report["diff"]
+        self.html = dashboard.render_dashboard(self.report)
+
+    # --- CASE I/J/K: gate colour follows the ACTUAL result; message matches it ----
+    def test_case_I_gate_fail_frame_is_red(self):
+        r = _gate_report([_mk("cors", "CORS reflects credentialed wildcard origin", Severity.HIGH,
+                              Status.VERIFIED, "confirmed", endpoint="http://localhost:3000/api/x")])
+        self.assertEqual(r["gate"]["result"], "FAIL")
+        html = dashboard.render_dashboard(r)
+        self.assertIn("gate-hero fail", html)             # red frame follows the result
+        self.assertNotIn("gate-hero warn", html)
+        self.assertNotIn("gate-hero pass", html)
+        self.assertIn("The gate is FAIL", html)
+        self.assertNotIn(dashboard.GATE_MESSAGE, html)    # never the WARN copy on a FAIL
+        _assert_clean(self, html)
+
+    def test_case_J_gate_warn_frame_is_amber(self):
+        # needs-manual-review only, no verified High/Critical -> WARN. This is the ONLY
+        # state whose honest copy is GATE_MESSAGE (it preserves the coverage the rewritten
+        # test_gate_rendered_from_report_not_recomputed intentionally gave up).
+        r = _gate_report([_mk("rate-limit", "Rate limiting could not be confirmed", Severity.LOW,
+                              Status.NEEDS_MANUAL_REVIEW, "inconclusive",
+                              endpoint="http://localhost:3000/api/y")])
+        self.assertEqual(r["gate"]["result"], "WARN")
+        html = dashboard.render_dashboard(r)
+        self.assertIn("gate-hero warn", html)
+        self.assertNotIn("gate-hero fail", html)
+        self.assertNotIn("gate-hero pass", html)
+        self.assertIn(dashboard.GATE_MESSAGE, html)
+        _assert_clean(self, html)
+
+    def test_case_K_gate_pass_frame_is_green(self):
+        r = _gate_report([_mk("headers", "Security header present", Severity.LOW,
+                              Status.VERIFIED, "confirmed", endpoint="http://localhost:3000/api/z")])
+        self.assertEqual(r["gate"]["result"], "PASS")
+        html = dashboard.render_dashboard(r)
+        self.assertIn("gate-hero pass", html)
+        self.assertNotIn("gate-hero fail", html)
+        self.assertNotIn("gate-hero warn", html)
+        self.assertIn("The gate is PASS", html)
+        self.assertIn("No gate conditions were triggered.", html)
+        _assert_clean(self, html)
+
+    # --- CASE A: no baseline -> "NO BASELINE AVAILABLE", NOT "no changes" --------
+    def test_case_A_no_baseline_state(self):
+        report = _report()                       # diff is None (schema upgrade, no baseline)
+        self.assertIsNone(report["diff"])
+        html = dashboard.render_dashboard(report)
+        self.assertIn("NO BASELINE AVAILABLE", html)
+        self.assertIn("Regression comparison is unavailable for this assessment.", html)
+        self.assertIn("No baseline available for regression comparison.", html)
+        self.assertIn(">no baseline</span>", html)          # header chip, not "no changes"
+        # The no-baseline state must be visually distinct from a real "no changes" result.
+        self.assertNotIn("No changes detected", html)
+        _assert_clean(self, html)
+
+    # --- CASE B: baseline present, findings + surface identical -> "No changes" ---
+    def test_case_B_baseline_no_changes(self):
+        old = [_mk("cors", "CORS wildcard", Severity.HIGH, Status.NEEDS_MANUAL_REVIEW,
+                   "inconclusive", endpoint="http://localhost:3000/api/a")]
+        new = [_mk("cors", "CORS wildcard", Severity.HIGH, Status.NEEDS_MANUAL_REVIEW,
+                   "inconclusive", endpoint="http://localhost:3000/api/a")]
+        old_r = build_report(score_all(old), SCAN_OLD, "0.1.0", attack_surface=_surface(["/api/a"]))
+        new_r = build_report(score_all(new), SCAN_NEW, "0.1.0",
+                             attack_surface=_surface(["/api/a"]), baseline=build_baseline(old_r))
+        # A genuine comparison ran and found nothing changed — NOT a missing baseline.
+        self.assertIsInstance(new_r["diff"], dict)
+        html = dashboard.render_dashboard(new_r)
+        self.assertIn("No changes detected", html)
+        self.assertIn(">no changes</span>", html)
+        self.assertNotIn("NO BASELINE AVAILABLE", html)
+        self.assertIn("This is a real comparison result", html)
+        _assert_clean(self, html)
+
+    # --- CASE C-H: a real baseline-aware diff renders every change axis ----------
+    def test_changes_detected_header_and_causality(self):
+        self.assertTrue(self.diff["counts"]["new"] or self.diff["counts"]["resolved"])
+        self.assertIn(">changes detected</span>", self.html)
+        self.assertNotIn("NO BASELINE AVAILABLE", self.html)
+        self.assertNotIn("No changes detected", self.html)
+        # §13 causality disclaimer is always present on a real comparison.
+        self.assertIn("They do not establish causality.", self.html)
+
+    def test_case_C_new_finding_row(self):
+        self.assertGreaterEqual(self.diff["counts"]["new"], 1)
+        self.assertIn(">new</span>", self.html)
+        self.assertIn("SSRF candidate reachable", self.html)      # the new finding's title
+
+    def test_case_D_resolved_finding_row(self):
+        self.assertGreaterEqual(self.diff["counts"]["resolved"], 1)
+        self.assertIn(">resolved</span>", self.html)
+        self.assertIn("Vulnerable dependency lodash", self.html)  # resolved finding's title
+
+    def test_case_E_verification_change_never_conflated_with_lifecycle(self):
+        self.assertGreaterEqual(self.diff["counts"]["verification_changed"], 1)
+        self.assertGreaterEqual(self.diff["counts"]["status_changed"], 1)
+        # Two SEPARATE panels — the verification axis and the lifecycle axis never merge.
+        self.assertIn("Verification changes", self.html)
+        self.assertIn("a distinct axis from lifecycle status.", self.html)
+        self.assertIn("Lifecycle status changes", self.html)
+        self.assertIn("Lifecycle transitions — not a verification result.", self.html)
+
+    def test_case_F_severity_change_is_neutral(self):
+        self.assertGreaterEqual(self.diff["counts"]["severity_changed"], 1)
+        self.assertIn("Severity changes", self.html)
+        self.assertIn("CSP header missing", self.html)            # finding whose severity moved
+        low = self.html.lower()                                   # neutral wording only
+        for verdict in ("improved", "worsened", "safer", "more dangerous", "regressed"):
+            self.assertNotIn(verdict, low)
+
+    def test_case_G_score_change_labelled_watchtower_not_cvss(self):
+        self.assertGreaterEqual(self.diff["counts"]["score_changed"], 1)
+        self.assertIn("Risk score changes", self.html)
+        self.assertIn("WATCHTOWER Risk Score (not CVSS)", self.html)
+
+    def test_case_H_attack_surface_delta_not_vulnerabilities(self):
+        self.assertEqual(self.diff["counts"]["surface_added"], 2)
+        self.assertEqual(self.diff["counts"]["surface_removed"], 2)
+        self.assertIn("Attack surface delta", self.html)
+        self.assertIn("Added endpoints", self.html)
+        self.assertIn("Removed endpoints", self.html)
+        for path in ("/api/d", "/api/z", "/api/x", "/api/y"):
+            self.assertIn(path, self.html)
+        self.assertIn("not</b> vulnerabilities", self.html)       # candidates, not vulns
+
+    # --- CASE L: a degenerate/partial diff renders stably (no crash) -------------
+    def test_case_L_partial_diff_is_stable(self):
+        report = _gate_report([_mk("cors", "CORS wildcard", Severity.MEDIUM,
+                                   Status.NEEDS_MANUAL_REVIEW, "inconclusive",
+                                   endpoint="http://localhost:3000/api/a")])
+        # Optional diff sub-sections absent; only counts + note present.
+        report["diff"] = {"counts": {}, "note": "partial diff artifact"}
+        report["gate"] = evaluate_gate(report, report["diff"])
+        html = dashboard.render_dashboard(report)             # must not raise
+        # A diff dict (even empty) IS a comparison -> "no changes", never "no baseline".
+        self.assertIn("No changes detected", html)
+        self.assertNotIn("NO BASELINE AVAILABLE", html)
+        self.assertIn("partial diff artifact", html)          # note surfaced verbatim
+        self.assertIn("Attack surface delta", html)           # structural sections still render
+        _assert_clean(self, html)
+
+    def test_regression_change_rows_are_autoescaped(self):
+        # A NEW finding whose title is an XSS payload must reach the change table inert.
+        old = [_mk("cors", "benign baseline finding", Severity.HIGH,
+                   Status.NEEDS_MANUAL_REVIEW, "inconclusive",
+                   endpoint="http://localhost:3000/api/a")]
+        new = [_mk("cors", "benign baseline finding", Severity.HIGH,
+                   Status.NEEDS_MANUAL_REVIEW, "inconclusive",
+                   endpoint="http://localhost:3000/api/a"),
+               _mk("xss", "<script>alert(1)</script>", Severity.MEDIUM,
+                   Status.NEEDS_MANUAL_REVIEW, "inconclusive",
+                   endpoint="http://localhost:3000/api/e")]
+        old_r = build_report(score_all(old), SCAN_OLD, "0.1.0")
+        new_r = build_report(score_all(new), SCAN_NEW, "0.1.0", baseline=build_baseline(old_r))
+        html = dashboard.render_dashboard(new_r)
+        self.assertGreaterEqual(new_r["diff"]["counts"]["new"], 1)
+        self.assertNotIn("<script>alert(1)</script>", html)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html)
+
+    def test_gate_and_diff_are_read_from_report_not_recomputed(self):
+        # The rendered gate frame + message come straight from report['gate'] (engine output);
+        # the UI selects colour/copy by the engine's result and does not re-derive a decision.
+        gate = self.report["gate"]
+        self.assertIn(f"gate-hero {gate['result'].lower()}", self.html)
+        self.assertIn(gate["policy"], self.html)              # watchtower-gate-v1
+        self.assertTrue(gate["baseline_aware"])               # a real baseline was used
+        self.assertIn(dashboard._gate_message(gate), self.html)
 
 
 if __name__ == "__main__":

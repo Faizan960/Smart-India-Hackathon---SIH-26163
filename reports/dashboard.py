@@ -15,8 +15,8 @@ _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 # Left-nav items -> in-page section anchors (Overview is the whole page top).
 NAV_OPS = [("Overview", "overview", "compass"), ("Attack Surface", "surface", "radar"),
            ("Findings", "findings", "list"), ("Coverage", "coverage", "chip"),
-           ("Security Gate", "gate", "gate"), ("Evidence", "findings", "fingerprint"),
-           ("Runs", "runs", "history")]
+           ("Security Gate", "gate", "gate"), ("Regression", "regression", "layers"),
+           ("Evidence", "findings", "fingerprint"), ("Runs", "runs", "history")]
 
 FILTERS = [("all", "All"), ("critical", "Critical"), ("high", "High"), ("medium", "Medium"),
            ("low", "Low"), ("info", "Info"), ("verified", "Verified"),
@@ -75,7 +75,80 @@ def _views(findings):
 
 
 GATE_MESSAGE = ("No verified Critical or High findings are currently present. The assessment "
-                "remains in WARN because manual-review findings and coverage limitations remain.")
+                "remains in WARN because manual-review findings and/or coverage limitations are present.")
+
+
+def _gate_message(gate):
+    """A factual gate headline derived ONLY from the real gate result (never inferred).
+
+    WARN keeps the module-level GATE_MESSAGE constant (asserted verbatim by the UI tests);
+    PASS and FAIL get equally factual sentences. Nothing here recomputes the decision — it
+    only phrases the decision the engine already made in report['gate'].
+    """
+    result = (gate or {}).get("result")
+    if result == "FAIL":
+        return ("The gate is FAIL: one or more blocking conditions are present — verified "
+                "Critical/High findings, or findings newly verified against the baseline. "
+                "See the reasons below.")
+    if result == "PASS":
+        return ("The gate is PASS: no verified Critical or High findings, no newly verified "
+                "findings, and no manual-review findings or material coverage limitations.")
+    if result == "WARN":
+        return GATE_MESSAGE
+    return "Gate result unavailable for this assessment."
+
+
+# The nine canonical diff-count keys the engine emits (engine/diff.py). Normalising to
+# these guarantees the template always sees an integer, even for a partial diff (CASE L).
+_CANON_COUNTS = ("new", "resolved", "unchanged", "status_changed", "severity_changed",
+                 "score_changed", "verification_changed", "surface_added", "surface_removed")
+
+# The subset that represents an actual CHANGE. "unchanged" is deliberately excluded: a
+# comparison where every shared finding is unchanged is "NO CHANGES DETECTED", not a change.
+_CHANGE_COUNTS = ("new", "resolved", "status_changed", "severity_changed",
+                  "score_changed", "verification_changed", "surface_added", "surface_removed")
+
+
+def _score_change_view(c):
+    """A score-change row plus a neutral numeric delta (no 'better/worse' judgement).
+
+    The engine's score_changes rows carry from/to only; the delta is display arithmetic,
+    guarded so a non-numeric score never raises. Score is WATCHTOWER Risk Score, not CVSS.
+    """
+    frm, to = c.get("from"), c.get("to")
+    delta = (to - frm) if isinstance(frm, (int, float)) and isinstance(to, (int, float)) else None
+    return {"title": c.get("title"), "fingerprint": c.get("fingerprint"),
+            "from": frm, "to": to, "delta": delta}
+
+
+def _regression(report):
+    """Structured regression VIEW of report['diff'], or None when no baseline exists.
+
+    Reads ONLY the diff the engine already produced — it never recomputes a difference.
+    Returns None (not an empty diff) when report['diff'] is absent, so the template can
+    distinguish "NO BASELINE AVAILABLE" from a real "NO CHANGES DETECTED" comparison. All
+    count keys are normalised to integers so a partial diff still renders (CASE L).
+    """
+    diff = report.get("diff")
+    if not isinstance(diff, dict):
+        return None
+    dc = diff.get("counts") or {}
+    counts = {k: (dc.get(k) or 0) for k in _CANON_COUNTS}
+    return {
+        "baseline": diff.get("baseline") or {},
+        "current": diff.get("current") or {},
+        "counts": counts,
+        "any_change": any(counts[k] for k in _CHANGE_COUNTS),
+        "new": diff.get("new_findings") or [],
+        "resolved": diff.get("resolved_findings") or [],
+        "verification_changes": diff.get("verification_changes") or [],
+        "status_changes": diff.get("status_changes") or [],
+        "severity_changes": diff.get("severity_changes") or [],
+        "score_changes": [_score_change_view(c) for c in (diff.get("score_changes") or [])],
+        "surface_added": diff.get("attack_surface_additions") or [],
+        "surface_removed": diff.get("attack_surface_removals") or [],
+        "note": diff.get("note") or "",
+    }
 
 
 def _fmt_ts(iso):
@@ -114,17 +187,27 @@ def _context(report):
         "wt_version": report.get("watchtower_version") or env.get("watchtower_version") or "—",
         "gate": {"result": gate.get("result", "N/A"), "policy": gate.get("policy", "watchtower-gate-v1"),
                  "baseline_aware": gate.get("baseline_aware", False),
-                 "reasons": gate.get("reasons") or [], "message": GATE_MESSAGE},
+                 "reasons": gate.get("reasons") or [], "message": _gate_message(gate)},
+        "gate_counts": [
+            ("Verified Critical", counts.get("verified_critical", 0),
+             "critical" if counts.get("verified_critical") else "muted"),
+            ("Verified High", counts.get("verified_high", 0),
+             "orange" if counts.get("verified_high") else "muted"),
+            ("Verified Medium", counts.get("verified_medium", 0),
+             "warn" if counts.get("verified_medium") else "muted"),
+            ("Manual Review", counts.get("needs_manual_review", 0),
+             "warn" if counts.get("needs_manual_review") else "muted"),
+            ("New Verified", counts.get("new_verified", 0),
+             "critical" if counts.get("new_verified") else "muted"),
+        ],
         "posture": [
             ("Critical", counts.get("verified_critical", 0), s.get("critical", 0), "critical"),
             ("High", counts.get("verified_high", 0), s.get("high", 0), "high"),
             ("Medium", counts.get("verified_medium", 0), s.get("medium", 0), "medium"),
         ],
         "manual_review": s.get("needs_manual_review", 0),
-        "metrics": [("Verified Findings", s.get("verified", 0), "pass"),
-                    ("Manual Review", s.get("needs_manual_review", 0), "warn"),
-                    ("Skipped Scanners", len(scanners_skipped), "muted"),
-                    ("Unavailable Runtime Surfaces", len(unavail), "muted")],
+        "regression": _regression(report),
+        "commit": scan.get("commit"),
         "endpoints": asf.get("endpoint_count", 0),
         "modules": asf.get("security_module_count", 0),
         "integrations": asf.get("integration_count", 0),
@@ -204,21 +287,39 @@ body{overflow:hidden}
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .posture .num{font-size:34px}
 .posture .sub{font-size:11px;color:var(--muted);margin-top:6px}
-/* gate hero */
-.gate-hero{border:1px solid var(--warn);border-radius:var(--r-panel);overflow:hidden;
+/* gate hero — frame colour follows the real gate result (never hardcoded) */
+.gate-hero{border:1px solid var(--border);border-radius:var(--r-panel);overflow:hidden;
+  background:var(--surface)}
+.gate-hero.pass{border-color:var(--pass);
+  background:linear-gradient(180deg,rgba(16,185,129,0.08),rgba(16,185,129,0.02))}
+.gate-hero.warn{border-color:var(--warn);
   background:linear-gradient(180deg,rgba(245,158,11,0.08),rgba(245,158,11,0.02))}
+.gate-hero.fail{border-color:var(--critical);
+  background:linear-gradient(180deg,rgba(239,68,68,0.10),rgba(239,68,68,0.02))}
 .gate-hero .top{display:flex;align-items:flex-start;gap:18px;padding:20px 22px;flex-wrap:wrap}
 .gate-badge{font-family:var(--mono);font-size:26px;font-weight:600;letter-spacing:0.04em;
   padding:12px 20px;border-radius:10px;background:var(--warn);color:#1a1204}
 .gate-hero .msg{flex:1;min-width:240px}
 .gate-hero .msg h3{margin:0 0 6px;font-size:16px;letter-spacing:0.02em}
-.gate-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border);
+.gate-metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--border);
   border-top:1px solid var(--border)}
 .gate-metrics .m{background:var(--surface);padding:15px 18px}
 .gate-metrics .m .num{font-family:var(--mono);font-size:24px;font-weight:600;margin-top:6px}
 .reasons{display:flex;flex-direction:column;gap:8px;margin-top:14px}
 .reason{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:var(--r-btn);
   background:var(--elevated);border:1px solid var(--border);font-size:12.5px}
+/* regression / continuous-assessment view */
+.cmp{display:grid;grid-template-columns:1fr auto 1fr;gap:16px;align-items:center}
+.cmp-arrow{color:var(--muted);display:flex;justify-content:center}
+.cmp-col .caps{margin-bottom:3px}
+.tile .sub{font-size:11px;color:var(--muted);margin-top:5px}
+.chg{padding:9px 0;border-bottom:1px solid rgba(30,41,59,.5)}
+.chg:last-child{border-bottom:0}
+.chg-title{font-size:12.5px;color:var(--text);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;max-width:100%}
+.chg-tr{display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap}
+.chg-tr .wt-ico{color:var(--muted);flex:0 0 auto}
+.taglist{display:flex;flex-wrap:wrap;gap:6px}
 /* attack surface */
 .tag-row{display:grid;grid-template-columns:200px 1fr 54px;gap:12px;align-items:center;
   padding:7px 0;font-size:12.5px}
@@ -254,6 +355,7 @@ body{overflow:hidden}
   padding:8px}.sb-group{display:flex;gap:4px;margin:0}.sb-group>.caps,.sb-target{display:none}
   .main{height:auto}body{overflow:auto}.g3,.g2{grid-template-columns:1fr}}
 @media(max-width:560px){.g4,.gate-metrics{grid-template-columns:1fr}.tag-row{grid-template-columns:120px 1fr 40px}
+  .cmp{grid-template-columns:1fr}.cmp-arrow{transform:rotate(90deg)}
   .topbar-d{flex-wrap:wrap}}
 """
 
@@ -318,8 +420,9 @@ _TEMPLATE = r"""<!doctype html>
       </section>
 
       <section class="blk" id="gate">
-        <div class="blk-h">{{ icon('gate',18)|safe }}<h2>Security Gate Decision</h2></div>
-        <div class="gate-hero">
+        <div class="blk-h">{{ icon('gate',18)|safe }}<h2>Security Gate Decision</h2><span class="spacer"></span>
+          <span class="chip" style="--c:{{ GATE_COLOR.get(gate.result, '#64748B') }}">policy {{ gate.policy }}</span></div>
+        <div class="gate-hero {{ gate.result|lower }}">
           <div class="top">
             <div class="gate-badge" style="background:{{ GATE_COLOR.get(gate.result, '#64748B') }}">{{ gate.result }}</div>
             <div class="msg">
@@ -328,16 +431,214 @@ _TEMPLATE = r"""<!doctype html>
               <div class="reasons">
                 {% for r in gate.reasons %}
                 <div class="reason">{{ icon('warn',15)|safe }}<span>{{ r.message }}</span></div>
+                {% else %}
+                <div class="reason">{{ icon('check',15)|safe }}<span>No gate conditions were triggered.</span></div>
                 {% endfor %}
               </div>
             </div>
           </div>
           <div class="gate-metrics">
-            {% for label, val, tone in metrics %}
+            {% for label, val, tone in gate_counts %}
             <div class="m"><div class="caps">{{ label }}</div><div class="num" style="color:var(--{{ tone }})">{{ val }}</div></div>
             {% endfor %}
           </div>
         </div>
+      </section>
+      <section class="blk" id="regression">
+        <div class="blk-h">{{ icon('layers',18)|safe }}<h2>Assessment Regression</h2><span class="spacer"></span>
+          {% if regression %}{% if regression.any_change %}<span class="chip" style="--c:var(--warn)">changes detected</span>
+          {% else %}<span class="chip" style="--c:var(--pass)">no changes</span>{% endif %}
+          {% else %}<span class="chip hatch" style="--c:var(--muted)">no baseline</span>{% endif %}</div>
+
+        {% if not regression %}
+        <div class="panel"><div class="panel-b">
+          <div class="empty">{{ icon('history',26)|safe }}
+            <p style="margin-top:10px;font-weight:600;color:var(--text);font-size:14px">NO BASELINE AVAILABLE</p>
+            <p style="margin-top:6px">Regression comparison is unavailable for this assessment.</p>
+            <p class="mono dim" style="margin-top:6px;font-size:11px">No baseline available for regression comparison.</p></div>
+          <div class="cmp" style="margin-top:16px">
+            <div class="cmp-col"><div class="caps">Baseline</div><div class="mono dim" style="margin-top:2px">Not available</div></div>
+            <div class="cmp-arrow">{{ icon('arrow-right',18)|safe }}</div>
+            <div class="cmp-col"><div class="caps">Current assessment</div>
+              <div class="mono" style="margin-top:2px">{{ commit or NA }}</div>
+              <div class="mono dim" style="font-size:11px">{{ timestamp }}</div></div>
+          </div>
+          <p class="note" style="margin-top:14px">{{ icon('info',13)|safe }} A baseline enables regression tracking.
+            Create one with <span class="mono">python watchtower.py baseline save</span>, then re-run against it. No
+            historical data is shown here, because none exists — this is not a "no changes" result.</p>
+        </div></div>
+
+        {% else %}
+        <div class="panel" style="margin-bottom:14px"><div class="panel-b">
+          <div class="cmp">
+            <div class="cmp-col"><div class="caps">Baseline</div>
+              <div class="mono" style="margin-top:2px">{{ regression.baseline.commit or NA }}</div>
+              <div class="mono dim" style="font-size:11px">{{ regression.baseline.timestamp or NA }}</div></div>
+            <div class="cmp-arrow">{{ icon('arrow-right',18)|safe }}</div>
+            <div class="cmp-col"><div class="caps">Current</div>
+              <div class="mono" style="margin-top:2px">{{ regression.current.commit or NA }}</div>
+              <div class="mono dim" style="font-size:11px">{{ regression.current.timestamp or NA }}</div></div>
+          </div>
+        </div></div>
+        <div class="g3" style="margin-bottom:14px">
+          <div class="tile"><span class="accent-bar" style="--c:var(--accent)"></span>
+            <div class="caps">New</div>
+            <div class="num" style="color:{{ 'var(--accent)' if regression.counts.new else 'var(--muted)' }}">{{ regression.counts.new }}</div>
+            <div class="sub">absent from baseline</div></div>
+          <div class="tile"><span class="accent-bar" style="--c:var(--blue)"></span>
+            <div class="caps">Resolved</div>
+            <div class="num" style="color:{{ 'var(--blue)' if regression.counts.resolved else 'var(--muted)' }}">{{ regression.counts.resolved }}</div>
+            <div class="sub">in baseline, not current</div></div>
+          <div class="tile"><span class="accent-bar" style="--c:var(--muted)"></span>
+            <div class="caps">Unchanged</div><div class="num">{{ regression.counts.unchanged }}</div>
+            <div class="sub">same fingerprint, no change</div></div>
+        </div>
+
+        <div class="g4" style="margin-bottom:14px">
+          {% for lbl, val in [('Verification changes', regression.counts.verification_changed),
+                              ('Severity changes', regression.counts.severity_changed),
+                              ('Score changes', regression.counts.score_changed),
+                              ('Lifecycle changes', regression.counts.status_changed)] %}
+          <div class="tile"><div class="caps">{{ lbl }}</div>
+            <div class="num" style="font-size:22px;color:{{ 'var(--warn)' if val else 'var(--muted)' }}">{{ val }}</div></div>
+          {% endfor %}
+        </div>
+
+        {% if not regression.any_change %}
+        <div class="callout" style="--c:var(--pass);margin-bottom:14px">
+          <div class="caps" style="color:var(--pass)">{{ icon('check',13)|safe }} No changes detected</div>
+          <p class="note" style="margin-top:6px">A baseline comparison was performed and completed.
+          All {{ regression.counts.unchanged }} shared finding(s) are unchanged and the attack surface is
+          identical. This is a real comparison result — distinct from having no baseline.</p>
+        </div>
+        {% endif %}
+        {% if regression.new or regression.resolved %}
+        <div class="panel" style="margin-bottom:14px">
+          <div class="panel-h">{{ icon('list',16)|safe }}<span class="caps">Finding changes</span></div>
+          <div class="panel-b"><div class="tbl-wrap"><table class="tbl"><thead><tr>
+            <th>Change</th><th>Fingerprint</th><th>Title</th><th>Severity</th><th>Lifecycle</th><th>Verification</th><th>Risk Score</th>
+          </tr></thead><tbody>
+            {% for f in regression.new %}
+            <tr>
+              <td><span class="chip" style="--c:var(--accent)">new</span></td>
+              <td><span class="mono" style="font-size:11px">{{ f.fingerprint }}</span></td>
+              <td><span class="f-title" title="{{ f.title }}">{{ f.title }}</span></td>
+              <td><span class="chip" style="--c:{{ SEVERITY_COLOR.get(f.severity, '#64748B') }}">{{ f.severity }}</span></td>
+              <td><span class="chip" style="--c:{{ STATUS_COLOR.get(f.status, '#64748B') }}">{{ f.status|labelize }}</span></td>
+              <td>{% if f.verification_result %}<span class="chip" style="--c:{{ RESULT_COLOR.get(f.verification_result, '#64748B') }}">{{ f.verification_result }}</span>{% else %}<span class="dim">—</span>{% endif %}</td>
+              <td><span class="mono">{{ '%.1f'|format(f.score) if f.score is not none else '—' }}</span></td>
+            </tr>
+            {% endfor %}
+            {% for f in regression.resolved %}
+            <tr>
+              <td><span class="chip" style="--c:var(--blue)">resolved</span></td>
+              <td><span class="mono" style="font-size:11px">{{ f.fingerprint }}</span></td>
+              <td><span class="f-title" title="{{ f.title }}">{{ f.title }}</span></td>
+              <td><span class="chip" style="--c:{{ SEVERITY_COLOR.get(f.severity, '#64748B') }}">{{ f.severity }}</span></td>
+              <td><span class="chip" style="--c:{{ STATUS_COLOR.get(f.status, '#64748B') }}">{{ f.status|labelize }}</span></td>
+              <td>{% if f.verification_result %}<span class="chip" style="--c:{{ RESULT_COLOR.get(f.verification_result, '#64748B') }}">{{ f.verification_result }}</span>{% else %}<span class="dim">—</span>{% endif %}</td>
+              <td><span class="mono">{{ '%.1f'|format(f.score) if f.score is not none else '—' }}</span></td>
+            </tr>
+            {% endfor %}
+          </tbody></table></div>
+          <p class="note" style="margin-top:12px">{{ icon('info',13)|safe }} Structured diff data only.
+          Historical scanner evidence is not retained in the regression artifact.</p>
+          </div>
+        </div>
+        {% endif %}
+        {% if regression.verification_changes or regression.status_changes or regression.severity_changes or regression.score_changes %}
+        <div class="g2" style="margin-bottom:14px">
+          {% if regression.verification_changes %}
+          <div class="panel"><div class="panel-h">{{ icon('flask',16)|safe }}<span class="caps">Verification changes</span></div>
+            <div class="panel-b">
+              {% for c in regression.verification_changes %}
+              <div class="chg"><div class="chg-title" title="{{ c.title }}">{{ c.title }}</div>
+                <div class="chg-tr">
+                  <span class="chip" style="--c:{{ RESULT_COLOR.get(c['from'], '#64748B') }}">{{ c['from'] or 'none' }}</span>
+                  {{ icon('arrow-right',13)|safe }}
+                  <span class="chip" style="--c:{{ RESULT_COLOR.get(c['to'], '#64748B') }}">{{ c['to'] or 'none' }}</span></div></div>
+              {% endfor %}
+              <p class="note" style="margin-top:10px">Verification result transitions (confirmed / refuted /
+              inconclusive / not_applicable) — a distinct axis from lifecycle status.</p>
+            </div>
+          </div>
+          {% endif %}
+          {% if regression.status_changes %}
+          <div class="panel"><div class="panel-h">{{ icon('compass',16)|safe }}<span class="caps">Lifecycle status changes</span></div>
+            <div class="panel-b">
+              {% for c in regression.status_changes %}
+              <div class="chg"><div class="chg-title" title="{{ c.title }}">{{ c.title }}</div>
+                <div class="chg-tr">
+                  <span class="chip" style="--c:{{ STATUS_COLOR.get(c['from'], '#64748B') }}">{{ c['from']|labelize }}</span>
+                  {{ icon('arrow-right',13)|safe }}
+                  <span class="chip" style="--c:{{ STATUS_COLOR.get(c['to'], '#64748B') }}">{{ c['to']|labelize }}</span></div></div>
+              {% endfor %}
+              <p class="note" style="margin-top:10px">Lifecycle transitions — not a verification result.</p>
+            </div>
+          </div>
+          {% endif %}
+          {% if regression.severity_changes %}
+          <div class="panel"><div class="panel-h">{{ icon('scale',16)|safe }}<span class="caps">Severity changes</span></div>
+            <div class="panel-b">
+              {% for c in regression.severity_changes %}
+              <div class="chg"><div class="chg-title" title="{{ c.title }}">{{ c.title }}</div>
+                <div class="chg-tr">
+                  <span class="chip" style="--c:{{ SEVERITY_COLOR.get(c['from'], '#64748B') }}">{{ c['from'] }}</span>
+                  {{ icon('arrow-right',13)|safe }}
+                  <span class="chip" style="--c:{{ SEVERITY_COLOR.get(c['to'], '#64748B') }}">{{ c['to'] }}</span></div></div>
+              {% endfor %}
+            </div>
+          </div>
+          {% endif %}
+          {% if regression.score_changes %}
+          <div class="panel"><div class="panel-h">{{ icon('scale',16)|safe }}<span class="caps">Risk score changes</span></div>
+            <div class="panel-b">
+              {% for c in regression.score_changes %}
+              <div class="chg"><div class="chg-title" title="{{ c.title }}">{{ c.title }}</div>
+                <div class="chg-tr mono">
+                  <span>{{ '%.1f'|format(c['from']) if c['from'] is not none else '—' }}</span>
+                  {{ icon('arrow-right',13)|safe }}
+                  <span>{{ '%.1f'|format(c['to']) if c['to'] is not none else '—' }}</span>
+                  {% if c.delta is not none %}<span class="dim">Δ {{ '%+.1f'|format(c.delta) }}</span>{% endif %}</div></div>
+              {% endfor %}
+              <p class="note" style="margin-top:10px">WATCHTOWER Risk Score (not CVSS). Values are shown as
+              recorded; no "better" or "worse" judgement is implied.</p>
+            </div>
+          </div>
+          {% endif %}
+        </div>
+        {% endif %}
+        <div class="panel" style="margin-bottom:14px">
+          <div class="panel-h">{{ icon('radar',16)|safe }}<span class="caps">Attack surface delta</span></div>
+          <div class="panel-b">
+            <div class="g3">
+              <div class="tile"><div class="caps">Current surface</div><div class="num">{{ endpoints }}</div>
+                <div class="sub">endpoints (assessment targets)</div></div>
+              <div class="tile"><div class="caps">Added</div>
+                <div class="num" style="color:{{ 'var(--accent)' if regression.counts.surface_added else 'var(--muted)' }}">+{{ regression.counts.surface_added }}</div></div>
+              <div class="tile"><div class="caps">Removed</div>
+                <div class="num" style="color:{{ 'var(--blue)' if regression.counts.surface_removed else 'var(--muted)' }}">-{{ regression.counts.surface_removed }}</div></div>
+            </div>
+            {% if regression.surface_added %}
+            <div style="margin-top:12px"><div class="caps" style="margin-bottom:6px">Added endpoints</div>
+              <div class="taglist">{% for p in regression.surface_added %}<span class="chip" style="--c:var(--accent)">{{ p }}</span>{% endfor %}</div></div>
+            {% endif %}
+            {% if regression.surface_removed %}
+            <div style="margin-top:12px"><div class="caps" style="margin-bottom:6px">Removed endpoints</div>
+              <div class="taglist">{% for p in regression.surface_removed %}<span class="chip" style="--c:var(--blue)">{{ p }}</span>{% endfor %}</div></div>
+            {% endif %}
+            <p class="note" style="margin-top:12px">{{ icon('info',13)|safe }} Endpoints are attack-surface
+            candidates, <b>not</b> vulnerabilities. A surface delta is a structural change, not a security conclusion.</p>
+          </div>
+        </div>
+
+        <div class="callout" style="--c:var(--muted)">
+          <div class="caps">{{ icon('info',13)|safe }} On interpreting differences</div>
+          <p class="note" style="margin-top:6px">Assessment differences show observed changes between artifacts.
+          They do not establish causality.</p>
+          <p class="note" style="margin-top:6px">{{ regression.note }}</p>
+        </div>
+        {% endif %}
       </section>
       <section class="blk" id="surface">
         <div class="blk-h">{{ icon('radar',18)|safe }}<h2>Attack Surface</h2><span class="spacer"></span>
@@ -466,36 +767,24 @@ _TEMPLATE = r"""<!doctype html>
       </section>
 
       <section class="blk" id="runs">
-        <div class="g2">
-          <div class="panel"><div class="panel-h">{{ icon('history',16)|safe }}<span class="caps">Regression comparison</span></div>
-            <div class="panel-b">
-              {% if has_baseline %}
-              <div class="callout" style="--c:var(--accent)">A baseline is attached to this report.</div>
-              {% else %}
-              <div class="empty">{{ icon('history',26)|safe }}
-                <p style="margin-top:10px">No baseline available for regression comparison.</p></div>
-              {% endif %}
-              <p class="note" style="margin-top:12px">Reserved for continuous assessment. When a baseline
-              is supplied, this panel consumes <span class="mono">report.diff</span> directly — new,
-              resolved and changed findings are computed by the diff engine, not here.</p>
-            </div>
-          </div>
-          <div class="panel"><div class="panel-h">{{ icon('clock',16)|safe }}<span class="caps">Run history</span></div>
-            <div class="panel-b">
-              {% if runs %}
-              <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Run</th><th>Gate</th><th>Completed</th></tr></thead><tbody>
-                {% for r in runs %}
-                <tr><td class="mono">{{ r.id }}</td>
-                  <td><span class="chip" style="--c:{{ GATE_COLOR.get(r.gate, '#64748B') }}">{{ r.gate }}</span></td>
-                  <td class="mono">{{ r.timestamp }}</td></tr>
-                {% endfor %}
-              </tbody></table></div>
-              {% else %}
-              <div class="empty">Historical run comparison unavailable.</div>
-              {% endif %}
-            </div>
-          </div>
-        </div>
+        <div class="blk-h">{{ icon('clock',18)|safe }}<h2>Run History</h2><span class="spacer"></span>
+          <span class="mono dim" style="font-size:12px">newest first</span></div>
+        <div class="panel"><div class="panel-b">
+          {% if runs %}
+          <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Run</th><th>Gate</th><th>Completed</th></tr></thead><tbody>
+            {% for r in runs %}
+            <tr><td class="mono">{{ r.id }}</td>
+              <td><span class="chip" style="--c:{{ GATE_COLOR.get(r.gate, '#64748B') }}">{{ r.gate }}</span></td>
+              <td class="mono">{{ r.timestamp }}</td></tr>
+            {% endfor %}
+          </tbody></table></div>
+          {% else %}
+          <div class="empty">Historical run comparison unavailable.</div>
+          {% endif %}
+          <p class="note" style="margin-top:12px">{{ icon('info',13)|safe }} Regression against a baseline is
+          shown in the <a href="#regression" style="color:var(--accent)">Assessment Regression</a> section above,
+          computed by the diff engine from <span class="mono">report.diff</span> — never recomputed here.</p>
+        </div></div>
       </section>
     </div>
   </div>

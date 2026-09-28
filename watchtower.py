@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""WATCHTOWER - CLI orchestrator (Phase 2: multi-tool integration).
+"""WATCHTOWER - CLI orchestrator (Phase 3: correlation + verification).
 
 Pipeline stages:
   [1] Init  [2] Semgrep  [3] Gitleaks  [4] OSV-Scanner  [5] npm audit
   [6] Security headers  [7] OWASP ZAP  [8] Nuclei  [9] Normalize
-  [10] Score  [11] Report
+  [10] Correlate  [11] Verify  [12] Score  [13] Report
 
-Each collector stage is independently executable and records an honest execution
-status: a missing tool is 'skipped', a crash/parse error is 'failed', a real run is
-'success'. Skips and failures are reported plainly, never disguised as clean results.
-Only the local repository and the local target are ever touched.
+Correlation raises confidence when independent tools agree (-> correlated); it never
+verifies. Verification runs safe, local-only verifiers that demonstrate a property
+against the live target or the local source tree, and is the ONLY stage that may mark a
+finding verified or false-positive. Scoring runs last so the WATCHTOWER Risk Score
+reflects each finding's final lifecycle status.
+
+Each collector stage is independently executable and records an honest execution status:
+a missing tool is 'skipped', a crash/parse error is 'failed', a real run is 'success'.
+Skips and failures are reported plainly, never disguised as clean results. Only the local
+repository and the local target are ever touched.
 """
 from __future__ import annotations
 
@@ -20,7 +26,8 @@ from datetime import datetime, timezone
 
 from config import ConfigError, WATCHTOWER_VERSION, WatchtowerConfig
 from checks.security_headers import run_headers_probe
-from engine import normalizer, scorer
+from checks.verifiers import VerificationContext, run_verifiers
+from engine import correlator, normalizer, scorer
 from engine.evidence import EvidenceStore
 from engine.execution import ToolExecution
 from engine.git_meta import get_git_metadata
@@ -33,7 +40,7 @@ from scanners.npm_audit import run_npm_audit
 from scanners.zap import run_zap
 from scanners.nuclei import run_nuclei
 
-TOTAL_STAGES = 11
+TOTAL_STAGES = 13
 
 
 def _now_iso() -> str:
@@ -180,10 +187,22 @@ def run(config) -> int:
         rec.finding_count = counts.get(rec.tool, 0)
     print(f"      normalized {len(findings)} finding(s)")
 
-    _stage(10, "Calculating WATCHTOWER Risk Scores")
+    _stage(10, "Correlating findings across tools")
+    correlation = correlator.correlate(findings)
+    print(f"      {len(correlation)} correlation group(s) (cross-tool corroboration -> correlated)")
+
+    _stage(11, "Verifying findings (safe, local-only probes)")
+    context = VerificationContext.build(
+        repo_path=config.repo_path, target_url=config.normalized_target)
+    verify_counts = run_verifiers(findings, context)
+    applied = sum(verify_counts.values())
+    print(f"      {applied} verification transition(s): "
+          + ", ".join(f"{name}={n}" for name, n in verify_counts.items()))
+
+    _stage(12, "Calculating WATCHTOWER Risk Scores")
     scorer.score_all(findings)
 
-    _stage(11, "Generating reports")
+    _stage(13, "Generating reports")
     scan = {
         "timestamp": _now_iso(),
         "target": config.normalized_target,
@@ -199,6 +218,10 @@ def run(config) -> int:
         "execution": execution,
         "git": git_meta,
         "watchtower_version": WATCHTOWER_VERSION,
+        "analysis": {
+            "correlation_groups": correlation,
+            "verification_transitions": verify_counts,
+        },
     })
     json_path = write_json_report(store.path("report.json"), report)
     html_path = write_html_report(store.path("report.html"), report)
@@ -219,6 +242,11 @@ def _print_summary(report, records, store) -> None:
         f"(critical={summary['critical']} high={summary['high']} "
         f"medium={summary['medium']} low={summary['low']} info={summary['info']})"
     )
+    print(
+        f"  lifecycle: suspected={summary['suspected']} correlated={summary['correlated']} "
+        f"verified={summary['verified']} needs_review={summary['needs_manual_review']} "
+        f"false_positive={summary['false_positive']}"
+    )
     for rec in records:
         line = f"  {rec.tool}: {rec.status} ({rec.finding_count} finding(s), {rec.duration_seconds}s)"
         if rec.error:
@@ -227,17 +255,24 @@ def _print_summary(report, records, store) -> None:
     dup = report.get("duplicate_groups") or []
     if dup:
         print(f"  duplicate groups: {len(dup)} (same vuln reported by multiple tools)")
+    cor = report.get("correlation_groups") or []
+    if cor:
+        print(f"  correlation groups: {len(cor)} (independent tools corroborate -> correlated)")
+    skipped = summary.get("scanners_skipped") or []
+    if skipped:
+        print(f"  scanners skipped: {', '.join(skipped)}")
     if any(rec.status == "failed" for rec in records):
         print("  NOTE: one or more tools failed; findings are incomplete (see above).")
     if all(rec.status != "success" for rec in records):
         print("  NOTE: no tool produced results; this is not a claim that the target is safe.")
+    print("  NOTE: 'verified' means a probe demonstrated the property; correlation is not verification.")
     print(f"  artefacts: {store.run_dir}")
 
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="watchtower",
-        description="WATCHTOWER - automated security assessment (Phase 2: multi-tool).",
+        description="WATCHTOWER - automated security assessment (Phase 3: correlation + verification).",
     )
     parser.add_argument("--repo", required=True, help="Path to the target repository (never modified).")
     parser.add_argument("--target", required=True, help="Base URL of the running target, e.g. http://localhost:3000")

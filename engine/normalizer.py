@@ -13,9 +13,9 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from checks.security_headers import (
+    EXPECTED_PROPERTY as HEADER_EXPECTED,
     REFERENCES as HEADER_REFERENCES,
     SECURITY_HEADERS,
-    is_loopback,
 )
 from model.finding import AssetKind, Finding, Severity, Status
 from engine.dedup import group_duplicates
@@ -216,63 +216,52 @@ def normalize_semgrep(result, repo_path: Optional[str] = None) -> list[Finding]:
 
 
 def normalize_headers(result) -> list[Finding]:
-    """Map a HeadersProbeResult into Findings (status: verified via active probe).
+    """Map a HeadersProbeResult into raw header observations (status: suspected).
 
-    An unreachable target yields NO findings — absence of data is never turned
-    into a fabricated result.
+    Each configured header becomes a *suspected* observation carrying the exact header,
+    the observed value (or None), the URL tested and the HTTP status. It is the
+    SecurityHeaderVerifier that later demonstrates the property from this observation and
+    moves it to verified (present -> refuted, absent -> confirmed, HSTS-on-loopback ->
+    not_applicable). An unreachable target yields NO findings — absence of data is never
+    turned into a fabricated result.
     """
     findings: list[Finding] = []
     if not result or not getattr(result, "reachable", False):
         return findings
-    loopback_http = result.scheme == "http" and is_loopback(result.host)
     for header, missing_severity in SECURITY_HEADERS.items():
         value = result.headers.get(header)
         present = value is not None
-        if present:
-            severity, result_state = Severity.INFO, "refuted"
-            rationale = f"Header present on {result.url}; missing-header concern refuted."
-            desc = (
-                f"{header} is present on the target response. Presence is informational; "
-                "the correctness of the policy value is not assessed in this phase."
-            )
-        elif header == "Strict-Transport-Security" and loopback_http:
-            severity, result_state = Severity.INFO, "not_applicable"
-            rationale = (
-                "HSTS cannot apply over plain HTTP on a loopback host; its absence here "
-                "is expected and is not a weakness."
-            )
-            desc = (
-                f"{header} is absent, but the target is plain HTTP on a loopback host, so "
-                "HSTS does not apply. Recorded as informational, not a weakness."
-            )
-        else:
-            severity, result_state = missing_severity, "confirmed"
-            rationale = f"Header absent from the response on {result.url}."
-            desc = (
-                f"{header} is not set on the target response. A missing response-hardening "
-                "header is a defense-in-depth gap, not necessarily an exploitable vulnerability."
-            )
         findings.append(
             Finding(
                 tool="security-headers",
                 title=f"{header} assessment",
-                description=desc,
-                severity=severity,
-                status=Status.VERIFIED,
+                description=(
+                    f"Security-header observation for {header} on {result.url}. The presence "
+                    "and value are recorded from a live HTTP response; the verdict is assigned "
+                    "by the security-header verifier, not by this observation alone."
+                ),
+                severity=missing_severity,
+                status=Status.SUSPECTED,
                 endpoint=result.url,
                 evidence={
                     "header": header,
                     "present": present,
                     "value": value,
+                    "observed_value": value,
+                    "expected_property": HEADER_EXPECTED.get(header, header),
+                    "url_tested": result.url,
                     "status_code": result.status_code,
+                    "http_status": result.status_code,
                     "response_time_ms": result.response_time_ms,
+                    "scheme": result.scheme,
+                    "host": result.host,
                 },
                 asset={"kind": AssetKind.UI, "ref": result.url, "weight": 1.0},
                 verification={
-                    "method": "active_probe",
-                    "probe": "security-headers",
-                    "result": result_state,
-                    "rationale": rationale,
+                    "method": "none",
+                    "probe": None,
+                    "result": None,
+                    "rationale": "Raw header observation; pending security-header verification.",
                     "timestamp": _now(),
                 },
                 references=list(HEADER_REFERENCES),

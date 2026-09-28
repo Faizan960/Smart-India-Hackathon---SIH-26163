@@ -24,6 +24,17 @@ SECURITY_HEADERS = {
     "Permissions-Policy": "low",
 }
 
+# What each header is expected to do when correctly set — surfaced verbatim in the
+# verified finding so the report states the tested property, not just a header name.
+EXPECTED_PROPERTY = {
+    "Content-Security-Policy": "a policy restricting sources (e.g. default-src 'self') to limit XSS/injection",
+    "Strict-Transport-Security": "max-age enforcing HTTPS for the domain (applies to HTTPS deployments)",
+    "X-Content-Type-Options": "nosniff, to stop MIME-type sniffing",
+    "X-Frame-Options": "DENY or SAMEORIGIN, to prevent clickjacking",
+    "Referrer-Policy": "a privacy-preserving policy (e.g. no-referrer or strict-origin-when-cross-origin)",
+    "Permissions-Policy": "an allow-list restricting powerful browser features",
+}
+
 REFERENCES = ["https://owasp.org/www-project-secure-headers/"]
 
 

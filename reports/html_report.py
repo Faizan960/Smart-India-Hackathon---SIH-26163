@@ -21,6 +21,15 @@ _SEVERITY_COLOR = {
     "info": "#4b5563",
 }
 
+# Lifecycle status -> pill colour. Verified/false-positive are terminal probe verdicts.
+_STATUS_COLOR = {
+    "verified": "#15803d",
+    "correlated": "#7c3aed",
+    "suspected": "#0e7490",
+    "needs_manual_review": "#b45309",
+    "false_positive": "#4b5563",
+}
+
 
 def render_html(report: dict) -> str:
     raw_findings = report.get("findings", []) or []
@@ -47,7 +56,9 @@ def render_html(report: dict) -> str:
         scan=report.get("scan", {}),
         execution=report.get("execution", []) or [],
         duplicate_groups=report.get("duplicate_groups", []) or [],
+        correlation_groups=report.get("correlation_groups", []) or [],
         severity_color=_SEVERITY_COLOR,
+        status_color=_STATUS_COLOR,
         generated=datetime.now(timezone.utc).isoformat(),
     )
 
@@ -150,6 +161,24 @@ _TEMPLATE = r"""<!DOCTYPE html>
     <strong>not</strong> cross-tool correlation — sources are preserved, not merged.</p>
   </section>
   {% endif %}
+  {% if correlation_groups %}
+  <section>
+    <h2>Correlation groups (independent tools agree)</h2>
+    <table>
+      <tr><th>Group</th><th>Shared key(s)</th><th>Tools</th><th>Findings</th></tr>
+      {% for g in correlation_groups %}
+      <tr>
+        <td><code>{{ g.group }}</code></td>
+        <td class="note">{{ g.keys | join(', ') }}</td>
+        <td class="note">{{ g.tools | join(', ') }}</td>
+        <td class="note">{% for m in g.members %}<code>{{ m.id }}</code> ({{ m.status }}){% if not loop.last %}, {% endif %}{% endfor %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    <p class="note">Correlation raises confidence when independent tools corroborate the same
+    issue. It promotes findings to <strong>correlated</strong> — never to verified.</p>
+  </section>
+  {% endif %}
   <section>
     <h2>Summary</h2>
     <div class="grid">
@@ -160,6 +189,19 @@ _TEMPLATE = r"""<!DOCTYPE html>
       <div class="stat"><div class="n">{{ summary.low }}</div><div class="l">Low</div></div>
       <div class="stat"><div class="n">{{ summary.info }}</div><div class="l">Info</div></div>
     </div>
+    <div class="grid">
+      <div class="stat"><div class="n">{{ summary.suspected }}</div><div class="l">Suspected</div></div>
+      <div class="stat"><div class="n">{{ summary.correlated }}</div><div class="l">Correlated</div></div>
+      <div class="stat"><div class="n">{{ summary.verified }}</div><div class="l">Verified</div></div>
+      <div class="stat"><div class="n">{{ summary.needs_manual_review }}</div><div class="l">Needs review</div></div>
+      <div class="stat"><div class="n">{{ summary.false_positive }}</div><div class="l">False positive</div></div>
+      <div class="stat"><div class="n">{{ summary.skipped_count }}</div><div class="l">Scanners skipped</div></div>
+    </div>
+    <p class="note">Lifecycle: <strong>suspected</strong> (single scanner) &rarr;
+    <strong>correlated</strong> (independent tools agree) &rarr; <strong>verified</strong>
+    (a probe demonstrated the property). <strong>False positive</strong> means evidence
+    disproved the issue; <strong>needs review</strong> means the evidence was inconclusive.
+    Correlation raises confidence but is never verification.</p>
   </section>
 
   <section>
@@ -170,13 +212,13 @@ _TEMPLATE = r"""<!DOCTYPE html>
       claim that the target is safe.</p>
     {% else %}
     <table>
-      <tr><th>ID</th><th>Severity</th><th>Score</th><th>Status</th><th>Tool</th><th>Title</th><th>Location</th></tr>
+      <tr><th>ID</th><th>Severity</th><th>WATCHTOWER Risk Score</th><th>Status</th><th>Tool</th><th>Title</th><th>Location</th></tr>
       {% for f in findings %}
       <tr>
         <td><code>{{ f.id }}</code></td>
         <td><span class="pill" style="background:{{ severity_color.get(f.severity, '#4b5563') }}">{{ f.severity }}</span></td>
         <td>{{ f.score_value }}</td>
-        <td>{{ f.status }}</td>
+        <td><span class="pill" style="background:{{ status_color.get(f.status, '#4b5563') }}">{{ f.status.replace('_', ' ') }}</span></td>
         <td>{{ f.tool }}</td>
         <td>{{ f.title }}</td>
         <td class="note">{% if f.file %}{{ f.file }}{% if f.line %}:{{ f.line }}{% endif %}{% elif f.endpoint %}{{ f.endpoint }}{% endif %}</td>
@@ -189,13 +231,21 @@ _TEMPLATE = r"""<!DOCTYPE html>
       <h3>{{ f.id }} — {{ f.title }}</h3>
       <div class="meta">
         <span class="pill" style="background:{{ severity_color.get(f.severity, '#4b5563') }}">{{ f.severity }}</span>
-        · score {{ f.score_value }} · {{ f.status }} · {{ f.tool }}{% if f.cwe %} · {{ f.cwe }}{% endif %}
+        <span class="pill" style="background:{{ status_color.get(f.status, '#4b5563') }}">{{ f.status.replace('_', ' ') }}</span>
+        · WATCHTOWER Risk Score {{ f.score_value }} · {{ f.tool }}{% if f.cwe %} · {{ f.cwe }}{% endif %}
         {%- if f.evidence and f.evidence.identifiers %} · {{ f.evidence.identifiers | join(', ') }}{% endif %}
         {%- if f.evidence and f.evidence.dedup_group %} · <code>{{ f.evidence.dedup_group }}</code>{% endif %}
+        {%- if f.evidence and f.evidence.correlation_group %} · <code>{{ f.evidence.correlation_group }}</code>{% endif %}
       </div>
       <p>{{ f.description }}</p>
       {% if f.verification and f.verification.rationale %}
       <p class="note"><strong>Verification:</strong> {{ f.verification.method }}{% if f.verification.result %} &rarr; {{ f.verification.result }}{% endif %} — {{ f.verification.rationale }}</p>
+      {% endif %}
+      {% if f.evidence and f.evidence.dependency_type %}
+      <p class="note"><strong>Dependency reachability:</strong> {{ f.evidence.dependency }} · {{ f.evidence.dependency_type }} · {{ f.evidence.direct_or_transitive }} · reachable: {{ f.evidence.reachable }} — {{ f.evidence.reachability_reason }}</p>
+      {% endif %}
+      {% if f.evidence and f.evidence.remediation %}
+      <p class="note"><strong>Remediation:</strong> {{ f.evidence.remediation }}</p>
       {% endif %}
       <pre>{{ f.evidence_json }}</pre>
       {% if f.references %}

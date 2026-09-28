@@ -9,10 +9,17 @@ and — crucially — **verifies** the high-value ones with controlled, evidence
 probes. Its whole reason to exist is the gap between *"a scanner flagged this"* and
 *"this actually holds when exercised."*
 
-> **Status:** documentation & design stage. The prototype is specified but **not yet
-> built**. **Scan results will be documented after the first end-to-end assessment.** This
-> repository currently contains the architecture, methodology, and scope — no findings are
-> claimed.
+> **Status:** **Phase 2 (real multi-tool integration) is implemented.** The pipeline now
+> runs 11 stages (CLI → Semgrep → Gitleaks → OSV-Scanner → npm audit → security-headers →
+> OWASP ZAP baseline → Nuclei → normalize → WATCHTOWER Risk Score → JSON + HTML report),
+> with deterministic duplicate grouping and a per-tool execution record. Every stage records
+> an honest status, so a missing scanner (`skipped`), a crash/parse error (`failed`), or an
+> unreachable target is reported, never disguised as a clean result. **No findings are
+> fabricated and no severity is inflated.** The first real run against the World Monitor repo
+> produced genuine **npm audit** dependency findings; the tools that were not installed and
+> the DAST stages against the (not-running) local target were honestly recorded as
+> skipped/failed rather than passed. Correlation and World Monitor-specific verification
+> probes remain deferred to Phases 3–4, so nothing is yet marked `verified` by a probe.
 
 ## What it assesses
 
@@ -41,17 +48,59 @@ Findings move through an honest lifecycle — **Suspected → Correlated → Ver
 **False Positive** and **Needs Manual Review**). Correlation raises confidence; only a
 controlled probe grants `verified`.
 
-## Intended usage (prototype)
+## Running WATCHTOWER
 
 ```bash
+pip install -r requirements.txt
 python watchtower.py --repo ../worldmonitor --target http://localhost:3000
 ```
 
-One command produces an **HTML + JSON + SARIF** report backed by a per-run **evidence
-store** (raw tool output + probe request/response artefacts). Any collector that is not
-installed is recorded as skipped, not failed. Standing up the target is the user's job; per
-World Monitor's own `SELF_HOSTING.md`, `npm install && npm run dev` serves it on
-`http://localhost:3000`.
+Flags: `--output <dir>` (default `./output`); per-stage skips `--skip-semgrep`,
+`--skip-gitleaks`, `--skip-osv`, `--skip-npm-audit`, `--skip-headers`, `--skip-zap`,
+`--skip-nuclei`; and per-tool timeouts `--semgrep-timeout`, `--gitleaks-timeout`,
+`--osv-timeout`, `--npm-audit-timeout`, `--request-timeout`, `--zap-timeout`,
+`--nuclei-timeout`. Each stage is independently executable via its skip flag. Quote any
+repository path that contains spaces.
+
+One command runs the pipeline and writes a per-run **evidence store** under
+`output/run-<UTC-timestamp>/`: raw tool output (`raw/`), normalized `findings.json`, run
+`metadata.json`, and the **JSON + HTML report**. A collector that is not installed is
+recorded as **skipped** and an unreachable target as a **failed** stage — the run still
+completes and the report reflects exactly what did and did not execute. **No findings are
+invented.** Standing up the target is the user's job; per World Monitor's own
+`SELF_HOSTING.md`, `npm install && npm run dev` serves it on `http://localhost:3000`.
+
+The external scanners (Semgrep, Gitleaks, OSV-Scanner, npm, Nuclei, and either a native
+`zap-baseline.py` or the `ghcr.io/zaproxy/zaproxy` Docker image) are invoked as external
+tools; WATCHTOWER **never installs or pulls them for you**. Any scanner that is absent is
+recorded as `skipped` with install guidance, so the run always completes honestly. **Real
+scan numbers are only reported once they come from an actual run** (see the per-run report),
+never asserted in advance.
+
+### Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+### Implemented vs. deferred
+
+**Implemented (Phase 1):** CLI orchestrator · configuration & validation · Semgrep
+collector (safe subprocess, JSON parse) · security-headers/CSP probe (real HTTP) · finding
+normalization & deterministic IDs · WATCHTOWER Risk Score · per-run evidence store · JSON
+report · HTML report · unit tests.
+
+**Implemented (Phase 2):** Gitleaks collector (with adapter-level secret **redaction** —
+secret values never reach a report) · OSV-Scanner collector · npm audit collector · OWASP
+ZAP baseline collector (native or Docker, passive only) · Nuclei collector (controlled,
+non-destructive template set) · 11-stage orchestrator with independent per-stage skips ·
+honest per-tool **execution record** (`success` / `failed` / `skipped`, duration, exit
+code, finding count) · deterministic **duplicate grouping** on shared GHSA/CVE identifiers
+(not correlation) · expanded HTML/JSON reporting · synthetic-output unit tests for all five
+new collectors (75 tests total).
+
+**Not yet (Phases 3–4):** correlation engine · World Monitor-specific CORS / rate-limit /
+auth / SSRF-canary verification probes · SARIF output.
 
 ## Design principles
 

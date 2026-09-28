@@ -1,0 +1,1 @@
+"""WATCHTOWER normalized data model."""

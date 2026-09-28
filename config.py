@@ -13,6 +13,20 @@ DEFAULT_REQUEST_TIMEOUT = 10   # seconds
 DEFAULT_TOOL_TIMEOUT = 300     # gitleaks / osv / npm audit (seconds)
 DEFAULT_ZAP_TIMEOUT = 900      # ZAP baseline can take several minutes
 DEFAULT_NUCLEI_TIMEOUT = 600   # controlled Nuclei template run
+DEFAULT_RATE_LIMIT_COUNT = 10  # bounded, non-abusive request burst
+DEFAULT_CANARY_PORT = 9001     # loopback-only SSRF canary port
+
+# Internal WATCHTOWER component versions, recorded in the reproducibility manifest
+# (Phase 5, item 8). These are OUR probe/analysis versions — not the external tool
+# versions, which we deliberately do not shell out to collect.
+PROBE_VERSIONS = {
+    "attack-surface": "1", "security-headers": "1", "cors": "1", "rate-limit": "1",
+    "auth-mcp": "1", "ssrf": "1", "correlator": "1", "verifier": "1",
+    "evidence-graph": "1", "explainer": "1", "scorer": "watchtower-risk-score-v1",
+}
+# External scanners WATCHTOWER can orchestrate (versions not collected to avoid
+# running tools purely for --version; execution status is recorded instead).
+SCANNER_TOOLS = ("semgrep", "gitleaks", "osv-scanner", "npm-audit", "zap", "nuclei")
 
 
 class ConfigError(Exception):
@@ -40,6 +54,19 @@ class WatchtowerConfig:
     skip_npm_audit: bool = False
     skip_zap: bool = False
     skip_nuclei: bool = False
+    # Phase 5 — static attack-surface discovery (read-only).
+    skip_attack_surface: bool = False
+    # Phase 4 — active verification probes (local target only).
+    skip_cors: bool = False
+    skip_rate_limit: bool = False
+    skip_auth_mcp: bool = False
+    skip_ssrf: bool = False
+    rate_limit_count: int = DEFAULT_RATE_LIMIT_COUNT
+    canary_port: int = DEFAULT_CANARY_PORT
+    # Safety gate: active probes refuse a non-local target unless this is explicitly set.
+    allow_nonlocal_active: bool = False
+    # Phase 5: optional baseline report.json to diff this run against (read-only).
+    diff_against: str | None = None
 
     def validate(self) -> "WatchtowerConfig":
         """Fail fast on bad input before any tool runs."""
@@ -54,6 +81,14 @@ class WatchtowerConfig:
                 f"Invalid target URL: {self.target_url!r} (expected http(s)://host[:port])"
             )
 
+        if not 1 <= int(self.rate_limit_count) <= 25:
+            raise ConfigError(
+                f"rate_limit_count must be between 1 and 25 (bounded, non-abusive): "
+                f"{self.rate_limit_count!r}"
+            )
+        if not 1 <= int(self.canary_port) <= 65535:
+            raise ConfigError(f"canary_port out of range: {self.canary_port!r}")
+
         try:
             os.makedirs(self.output_dir, exist_ok=True)
         except OSError as exc:
@@ -67,3 +102,34 @@ class WatchtowerConfig:
     def normalized_target(self) -> str:
         """Target URL without a trailing slash (probes append their own path)."""
         return self.target_url.rstrip("/")
+
+    @property
+    def target_is_local(self) -> bool:
+        """True only for loopback targets — the default gate for active probes."""
+        host = (urlparse(self.target_url).hostname or "").strip("[]").lower()
+        return host in {"localhost", "127.0.0.1", "::1"}
+
+    def config_manifest(self) -> dict:
+        """Sanitised configuration for the reproducibility manifest (no secrets)."""
+        return {
+            "target": self.normalized_target,
+            "output_dir": self.output_dir,
+            "timeouts": {
+                "semgrep": self.semgrep_timeout, "request": self.request_timeout,
+                "gitleaks": self.gitleaks_timeout, "osv": self.osv_timeout,
+                "npm_audit": self.npm_audit_timeout, "zap": self.zap_timeout,
+                "nuclei": self.nuclei_timeout,
+            },
+            "skips": {
+                "attack_surface": self.skip_attack_surface, "semgrep": self.skip_semgrep,
+                "gitleaks": self.skip_gitleaks, "osv": self.skip_osv,
+                "npm_audit": self.skip_npm_audit, "headers": self.skip_headers,
+                "zap": self.skip_zap, "nuclei": self.skip_nuclei, "cors": self.skip_cors,
+                "rate_limit": self.skip_rate_limit, "auth_mcp": self.skip_auth_mcp,
+                "ssrf": self.skip_ssrf,
+            },
+            "rate_limit_count": self.rate_limit_count,
+            "canary_port": self.canary_port,
+            "allow_nonlocal_active": self.allow_nonlocal_active,
+            "target_is_local": self.target_is_local,
+        }

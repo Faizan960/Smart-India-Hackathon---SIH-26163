@@ -2,21 +2,31 @@
 
 A Verifier takes a normalized (suspected/correlated) Finding, gathers *evidence* about
 whether the underlying property actually holds against the local target or the local
-source tree, and records a status transition through :mod:`engine.lifecycle`. Only a
-verifier may move a finding to VERIFIED or FALSE_POSITIVE.
+source tree, and records the outcome through :mod:`engine.lifecycle`. Only a verifier may
+move a finding out of suspected/correlated.
 
-Verifiers here are strictly non-destructive: they read local files and interpret the
-already-collected probe output. They never attack the target, never fuzz, never reach
-third-party or cloud-metadata hosts. The CORS / rate-limit / auth / SSRF verifiers are
-declared as interfaces (Phase 4) and intentionally decline rather than guess; when SSRF
-is implemented it must use a LOCAL canary only.
+Verification *result* and lifecycle *status* are two separate concepts. A verifier reports
+a result (confirmed / refuted / inconclusive / not_applicable) and :func:`lifecycle.
+apply_verification` maps it to the status (confirmed->verified, refuted/not_applicable->
+false_positive, inconclusive->needs_manual_review). A probe can NEVER bypass that mapping:
+e.g. a "refuted" result can only ever yield false_positive, never "verified".
+
+Verifiers are strictly non-destructive and local-only: they read local files or interpret
+the output of the controlled, loopback-scoped active probes (headers / CORS / rate-limit /
+auth-MCP / SSRF-canary). They never brute-force, never fuzz, and never reach third-party
+or cloud-metadata hosts.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
 
+from checks.active_base import ProbeVerdict
+from checks.auth_mcp import classify_auth
+from checks.cors import classify_cors
+from checks.rate_limit import classify_rate_limit
 from checks.security_headers import EXPECTED_PROPERTY, SECURITY_HEADERS, is_loopback
+from checks.ssrf import classify_ssrf
 from engine import lifecycle
 from engine.deps import DEFAULT_SOURCE_DIRS, analyze_dependency, load_manifests
 from model.finding import Severity, Status
@@ -50,15 +60,35 @@ class Verifier:
         raise NotImplementedError
 
 
+def _apply_verdict(finding, verdict: ProbeVerdict, *, actor, probe, method="active_probe") -> bool:
+    """Stamp a probe verdict onto a finding and route it through lifecycle enforcement.
+
+    Sets the (possibly re-rated) severity, records the verification evidence, and calls
+    :func:`lifecycle.apply_verification` so the result -> status mapping is enforced in one
+    place. Returns True iff the lifecycle transition was applied.
+    """
+    finding.severity = verdict.severity
+    updates = dict(verdict.evidence or {})
+    updates["verification_status"] = verdict.result
+    updates["evidence"] = verdict.rationale
+    if verdict.remediation:
+        updates["remediation"] = verdict.remediation
+        finding.fix = {"recommendation": verdict.remediation}
+    return lifecycle.apply_verification(
+        finding, result=verdict.result, actor=actor, method=method, probe=probe,
+        rationale=verdict.rationale, evidence_updates=updates)
+
+
 class SecurityHeaderVerifier(Verifier):
-    """Turn a raw security-header observation into a probed verdict.
+    """Turn a raw security-header observation into a probed verification result.
 
     The header probe already ran (an active HTTP GET); this verifier interprets that live
-    observation and demonstrates the property:
-      * header present                    -> missing-header concern REFUTED (informational)
-      * header absent + applicable        -> missing header CONFIRMED (a real, probed gap)
-      * HSTS absent over loopback http     -> NOT APPLICABLE (absence expected, not a weakness)
-    All three are 'verified' — the live response is direct evidence either way.
+    observation:
+      * header present                  -> missing-header concern REFUTED  (-> false_positive)
+      * header absent + applicable      -> missing header CONFIRMED         (-> verified)
+      * HSTS absent over loopback http  -> NOT_APPLICABLE                   (-> false_positive)
+    Only a genuinely-absent, applicable header is a verified gap; a present header or an
+    inapplicable one is a false positive, never "verified".
     """
 
     name = "security-header"
@@ -75,43 +105,42 @@ class SecurityHeaderVerifier(Verifier):
         url = ev.get("url_tested") or finding.endpoint
         expected = EXPECTED_PROPERTY.get(header, header)
         missing_severity = SECURITY_HEADERS.get(header, "low")
+        ev.setdefault("expected_property", expected)
 
         if present:
-            severity, result = Severity.INFO, "refuted"
-            statement = (f"{header} is present on {url} (HTTP {ev.get('status_code')}); the "
-                         "missing-header concern is refuted by the live response.")
-            remediation = "Present. Review the policy value for strictness in a later phase."
+            verdict = ProbeVerdict(
+                lifecycle.REFUTED,
+                f"{header} is present on {url} (HTTP {ev.get('status_code')}); the missing-header "
+                "concern is refuted by the live response.",
+                Severity.INFO,
+                remediation="Present. Review the policy value for strictness in a later phase.")
         elif header == "Strict-Transport-Security" and scheme == "http" and is_loopback(host):
-            severity, result = Severity.INFO, "not_applicable"
-            statement = (f"{header} is absent, but the target is plain HTTP on a loopback host "
-                         f"({host}); HSTS cannot apply, so its absence is not a weakness here.")
-            remediation = "Enforce HSTS in production over HTTPS; not applicable on local HTTP."
+            verdict = ProbeVerdict(
+                lifecycle.NOT_APPLICABLE,
+                f"{header} is absent, but the target is plain HTTP on a loopback host ({host}); "
+                "HSTS cannot apply, so its absence is not a weakness here.",
+                Severity.INFO,
+                remediation="Enforce HSTS in production over HTTPS; not applicable on local HTTP.")
         else:
-            severity, result = missing_severity, "confirmed"
-            statement = (f"{header} is absent from the response on {url} "
-                         f"(HTTP {ev.get('status_code')}); missing-header gap confirmed by probe.")
-            remediation = f"Set the {header} response header. Expected: {expected}"
-
-        finding.severity = severity
-        ev["verification_status"] = result
-        ev["evidence"] = statement
-        ev["remediation"] = remediation
-        ev.setdefault("expected_property", expected)
-        return lifecycle.transition(
-            finding, Status.VERIFIED, actor=self.name, result=result,
-            method="active_probe", probe="security-headers", rationale=statement)
+            verdict = ProbeVerdict(
+                lifecycle.CONFIRMED,
+                f"{header} is absent from the response on {url} (HTTP {ev.get('status_code')}); "
+                "missing-header gap confirmed by probe.",
+                missing_severity,
+                remediation=f"Set the {header} response header. Expected: {expected}")
+        return _apply_verdict(finding, verdict, actor=self.name, probe="security-headers")
 
 
 class DependencyReachabilityVerifier(Verifier):
     """Decide whether a dependency advisory plausibly affects the running target.
 
-    Uses the local manifests only and never asserts a vulnerability just because a scanner
-    named the package:
-      * package absent from lockfile            -> FALSE_POSITIVE (advisory doesn't match tree)
-      * development-only dependency             -> FALSE_POSITIVE for the production target
-                                                    (a dev/CI residual risk is disclosed)
-      * production + imported by app source      -> stays SUSPECTED/CORRELATED (needs Phase-4 probe)
-      * production + transitive + not imported   -> NEEDS_MANUAL_REVIEW
+    Uses local manifests only and never asserts a vulnerability just because a scanner named
+    the package:
+      * package absent from lockfile          -> REFUTED         (advisory doesn't match tree)
+      * development-only dependency           -> NOT_APPLICABLE   (out of scope for a prod target)
+      * production + imported by app source   -> INCONCLUSIVE     (reachable, not yet exploited)
+      * production + transitive + not imported-> INCONCLUSIVE     (needs manual review)
+    Nothing here reaches "verified"; demonstrating exploitation needs an active probe.
     """
 
     name = "dependency-reachability"
@@ -132,88 +161,93 @@ class DependencyReachabilityVerifier(Verifier):
         )
         ev.update(facts.as_evidence())
         fixed = ev.get("fixed_version")
-        ev["remediation"] = (
+        remediation = (
             f"Upgrade '{name}' beyond the vulnerable range (npm/OSV suggests {fixed}); "
             "verify compatibility." if fixed
             else f"Track the upstream fix for '{name}'; no fixed version was reported by the tool.")
 
         if facts.manifest_error:
-            return lifecycle.transition(
-                finding, Status.NEEDS_MANUAL_REVIEW, actor=self.name,
-                method="dependency-reachability", result="inconclusive",
-                rationale=(f"Could not analyse reachability: {facts.manifest_error} "
-                           "Manual review required."))
-        if not facts.present_in_lock:
-            return lifecycle.transition(
-                finding, Status.FALSE_POSITIVE, actor=self.name,
-                method="dependency-reachability", result="refuted",
-                rationale=facts.reachability_reason)
-        if facts.dependency_type == "development":
-            return lifecycle.transition(
-                finding, Status.FALSE_POSITIVE, actor=self.name,
-                method="dependency-reachability", result="refuted",
-                rationale=(facts.reachability_reason + " Scoped out of this production-target "
-                           "assessment; a development/CI risk may remain and is disclosed here."))
-        if facts.reachable == "imported":
-            return lifecycle.transition(
-                finding, finding.status, actor=self.name,
-                method="dependency-reachability", result="inconclusive",
-                rationale=(facts.reachability_reason + " Remains suspected: reachability is "
-                           "shown, but exploitation is not demonstrated without a Phase-4 probe."))
-        return lifecycle.transition(
-            finding, Status.NEEDS_MANUAL_REVIEW, actor=self.name,
-            method="dependency-reachability", result="inconclusive",
-            rationale=facts.reachability_reason)
+            result, severity, reason = (lifecycle.INCONCLUSIVE, finding.severity,
+                                        f"Could not analyse reachability: {facts.manifest_error} "
+                                        "Manual review required.")
+        elif not facts.present_in_lock:
+            result, severity, reason = (lifecycle.REFUTED, Severity.INFO, facts.reachability_reason)
+        elif facts.dependency_type == "development":
+            result, severity, reason = (
+                lifecycle.NOT_APPLICABLE, Severity.INFO,
+                facts.reachability_reason + " Scoped out of this production-target assessment; a "
+                "development/CI risk may remain and is disclosed here.")
+        elif facts.reachable == "imported":
+            result, severity, reason = (
+                lifecycle.INCONCLUSIVE, finding.severity,
+                facts.reachability_reason + " Reachability is shown, but exploitation is not "
+                "demonstrated without an active probe; manual review required.")
+        else:
+            result, severity, reason = (lifecycle.INCONCLUSIVE, finding.severity,
+                                        facts.reachability_reason)
+
+        verdict = ProbeVerdict(result, reason, severity, remediation=remediation)
+        return _apply_verdict(finding, verdict, actor=self.name,
+                              probe="dependency-reachability", method="dependency-reachability")
 
 
-class _StubVerifier(Verifier):
-    """A declared-but-deferred verifier interface (Phase 4).
+class _ProbeVerifier(Verifier):
+    """Base for the Phase-4 active verifiers: classify the probe evidence, apply the verdict.
 
-    It never fabricates a verdict: `applies_to` returns False so the pipeline leaves the
-    finding's status untouched until the real probe is implemented. Subclasses document
-    the intended, safe, local-only probe.
+    Each subclass names the tool whose normalized finding it interprets and the pure
+    ``classify`` function (over ``finding.evidence``) that produces the :class:`ProbeVerdict`.
     """
 
-    name = "stub"
-    probe_intent = "not implemented"
+    name = "probe"
+    tool = None
+    probe = None
+
+    @staticmethod
+    def classify(evidence) -> ProbeVerdict:  # pragma: no cover - interface
+        raise NotImplementedError
 
     def applies_to(self, finding) -> bool:
-        return False
+        return finding.tool == self.tool and isinstance(finding.evidence, dict)
 
     def verify(self, finding, context=None) -> bool:
-        return False
+        verdict = self.classify(finding.evidence)
+        return _apply_verdict(finding, verdict, actor=self.name, probe=self.probe)
 
 
-class CorsVerifier(_StubVerifier):
+class CorsVerifier(_ProbeVerifier):
     name = "cors"
-    probe_intent = ("Send controlled cross-origin requests to the LOCAL target and observe "
-                    "Access-Control-Allow-Origin/-Credentials to confirm a permissive policy.")
+    tool = "cors"
+    probe = "cors"
+    classify = staticmethod(classify_cors)
 
 
-class RateLimitVerifier(_StubVerifier):
+class RateLimitVerifier(_ProbeVerifier):
     name = "rate-limit"
-    probe_intent = ("Issue a bounded, non-abusive burst to a LOCAL endpoint and check for 429 / "
-                    "rate-limit headers — never a denial-of-service volume.")
+    tool = "rate-limit"
+    probe = "rate-limit"
+    classify = staticmethod(classify_rate_limit)
 
 
-class AuthVerifier(_StubVerifier):
-    name = "authentication"
-    probe_intent = ("Request a protected route / MCP method without credentials on the LOCAL "
-                    "target and confirm it is refused (401/403), never brute-forcing secrets.")
+class AuthVerifier(_ProbeVerifier):
+    name = "auth-mcp"
+    tool = "auth-mcp"
+    probe = "auth-mcp"
+    classify = staticmethod(classify_auth)
 
 
-class SsrfVerifier(_StubVerifier):
+class SsrfVerifier(_ProbeVerifier):
     name = "ssrf-canary"
-    probe_intent = ("Ask the LOCAL target to fetch a canary URL on a loopback server we control "
-                    "and observe the callback — never cloud-metadata or third-party hosts.")
+    tool = "ssrf"
+    probe = "ssrf-canary"
+    classify = staticmethod(classify_ssrf)
 
 
-ACTIVE_VERIFIERS = (SecurityHeaderVerifier, DependencyReachabilityVerifier)
-STUB_VERIFIERS = (CorsVerifier, RateLimitVerifier, AuthVerifier, SsrfVerifier)
+ACTIVE_VERIFIERS = (SecurityHeaderVerifier, DependencyReachabilityVerifier,
+                    CorsVerifier, RateLimitVerifier, AuthVerifier, SsrfVerifier)
 
 
 def default_verifiers():
-    """The verifiers that actually run today (Phase 3)."""
+    """The verifiers that run in a full WATCHTOWER assessment (Phases 3 + 4)."""
     return [cls() for cls in ACTIVE_VERIFIERS]
 
 

@@ -15,7 +15,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from checks.verifiers import (  # noqa: E402
-    DependencyReachabilityVerifier, SecurityHeaderVerifier, VerificationContext,
+    AuthVerifier, CorsVerifier, DependencyReachabilityVerifier, RateLimitVerifier,
+    SecurityHeaderVerifier, SsrfVerifier, VerificationContext,
     Verifier, default_verifiers, run_verifiers,
 )
 from engine import scorer  # noqa: E402
@@ -73,12 +74,15 @@ class TestDependencyReachability(_RepoFixture):
         self.assertEqual(f.evidence["direct_or_transitive"], "transitive")
         self.assertEqual(f.evidence["reachable"], "not-imported")
 
-    def test_production_imported_stays_suspected(self):
+    def test_production_imported_needs_review(self):
         repo = self._repo(
             lock_packages={"node_modules/image-size": {"version": "1.2.1", "dev": False}},
             src_files={"src/app.ts": "import sizeOf from 'image-size'\nsizeOf('x')\n"})
         f = self._verify(repo, _npm_finding("image-size"))
-        self.assertEqual(f.status, Status.SUSPECTED)   # reachable, but not exploited -> not verified
+        # Reachability is shown, but exploitation is not demonstrated -> inconclusive,
+        # which the lifecycle maps to needs_manual_review (NOT verified).
+        self.assertEqual(f.status, Status.NEEDS_MANUAL_REVIEW)
+        self.assertEqual(f.verification["result"], "inconclusive")
         self.assertEqual(f.evidence["reachable"], "imported")
 
     def test_direct_dependency_detected(self):
@@ -94,7 +98,9 @@ class TestDependencyReachability(_RepoFixture):
         f = self._verify(repo, _npm_finding("@vitest/mocker", severity=Severity.MEDIUM))
         self.assertEqual(f.status, Status.FALSE_POSITIVE)
         self.assertEqual(f.evidence["dependency_type"], "development")
-        self.assertEqual(f.verification["result"], "refuted")
+        # PART 0: a development-only dependency is not-applicable to a production target,
+        # and not_applicable maps to false_positive.
+        self.assertEqual(f.verification["result"], "not_applicable")
 
     def test_absent_from_lock_is_false_positive(self):
         repo = self._repo(lock_packages={})
@@ -116,11 +122,13 @@ class TestDependencyReachability(_RepoFixture):
 
 
 class TestSecurityHeaderVerifier(unittest.TestCase):
-    def test_present_header_refuted_informational(self):
+    def test_present_header_refuted_is_false_positive(self):
+        # PART 0: a "refuted" verification result maps to false_positive, NEVER verified.
         f = _header_finding("Content-Security-Policy", present=True, value="default-src 'self'")
         self.assertTrue(SecurityHeaderVerifier().verify(f))
-        self.assertEqual(f.status, Status.VERIFIED)
+        self.assertEqual(f.status, Status.FALSE_POSITIVE)
         self.assertEqual(f.severity, Severity.INFO)
+        self.assertEqual(f.verification["result"], "refuted")
         self.assertEqual(f.evidence["verification_status"], "refuted")
         self.assertEqual(f.verification["method"], "active_probe")
 
@@ -129,15 +137,18 @@ class TestSecurityHeaderVerifier(unittest.TestCase):
         self.assertTrue(SecurityHeaderVerifier().verify(f))
         self.assertEqual(f.status, Status.VERIFIED)
         self.assertEqual(f.severity, Severity.LOW)
+        self.assertEqual(f.verification["result"], "confirmed")
         self.assertEqual(f.evidence["verification_status"], "confirmed")
         self.assertIn("X-Frame-Options", f.evidence["remediation"])
 
     def test_absent_hsts_over_http_loopback_not_applicable(self):
+        # PART 0: "not_applicable" maps to false_positive, NEVER verified.
         f = _header_finding("Strict-Transport-Security", present=False, scheme="http",
                             host="localhost")
         SecurityHeaderVerifier().verify(f)
-        self.assertEqual(f.status, Status.VERIFIED)
+        self.assertEqual(f.status, Status.FALSE_POSITIVE)
         self.assertEqual(f.severity, Severity.INFO)
+        self.assertEqual(f.verification["result"], "not_applicable")
         self.assertEqual(f.evidence["verification_status"], "not_applicable")
 
     def test_verified_is_terminal(self):
@@ -147,6 +158,92 @@ class TestSecurityHeaderVerifier(unittest.TestCase):
         self.assertEqual(f.status, Status.VERIFIED)
         SecurityHeaderVerifier().verify(f)  # re-running is a no-op transition on a terminal state
         self.assertEqual(f.status, Status.VERIFIED)
+
+
+class TestActiveProbeVerifiers(unittest.TestCase):
+    """Each Phase-4 probe verifier routes its classifier's verdict through the lifecycle."""
+
+    def _finding(self, tool, evidence, *, endpoint="http://localhost:3000/"):
+        return Finding(tool=tool, title=f"{tool} finding", description="d",
+                       severity=Severity.INFO, status=Status.SUSPECTED,
+                       endpoint=endpoint, evidence=dict(evidence))
+
+    def test_cors_confirmed_maps_to_verified(self):
+        f = self._finding("cors", {
+            "refused": False, "reachable": True, "origin_sent": "https://evil.example",
+            "simple": {"Access-Control-Allow-Origin": "https://evil.example",
+                       "Access-Control-Allow-Credentials": "true"}, "preflight": {}})
+        self.assertTrue(CorsVerifier().verify(f))
+        self.assertEqual(f.status, Status.VERIFIED)
+        self.assertEqual(f.verification["result"], "confirmed")
+        self.assertEqual(f.severity, Severity.HIGH)
+
+    def test_cors_not_reflected_is_false_positive(self):
+        f = self._finding("cors", {
+            "refused": False, "reachable": True, "origin_sent": "https://evil.example",
+            "simple": {"Access-Control-Allow-Origin": "https://app.example"}, "preflight": {}})
+        self.assertTrue(CorsVerifier().verify(f))
+        self.assertEqual(f.status, Status.FALSE_POSITIVE)
+        self.assertEqual(f.verification["result"], "refuted")
+
+    def test_rate_limit_enforced_is_false_positive(self):
+        f = self._finding("rate-limit", {
+            "refused": False, "reachable": True, "statuses": [200, 429],
+            "saw_429": True, "rate_limit_headers": {}, "request_count": 2})
+        self.assertTrue(RateLimitVerifier().verify(f))
+        self.assertEqual(f.status, Status.FALSE_POSITIVE)   # enforcement present -> concern refuted
+        self.assertEqual(f.verification["result"], "refuted")
+
+    def test_rate_limit_no_signal_needs_review(self):
+        f = self._finding("rate-limit", {
+            "refused": False, "reachable": True, "statuses": [200, 200],
+            "saw_429": False, "rate_limit_headers": {}, "request_count": 2})
+        self.assertTrue(RateLimitVerifier().verify(f))
+        self.assertEqual(f.status, Status.NEEDS_MANUAL_REVIEW)  # absence never "confirmed"
+        self.assertEqual(f.verification["result"], "inconclusive")
+
+    def test_auth_enforced_is_false_positive(self):
+        f = self._finding("auth-mcp", {
+            "refused": False, "endpoint": "http://localhost:3000/api/mcp", "kind": "mcp",
+            "expected": "protected", "status_by_state": {"none": 401}})
+        self.assertTrue(AuthVerifier().verify(f))
+        self.assertEqual(f.status, Status.FALSE_POSITIVE)
+        self.assertEqual(f.verification["result"], "refuted")
+
+    def test_auth_exposed_mcp_tools_confirmed(self):
+        f = self._finding("auth-mcp", {
+            "refused": False, "endpoint": "http://localhost:3000/api/mcp", "kind": "mcp",
+            "expected": "protected", "status_by_state": {"none": 200},
+            "mcp_exposed_tools": True})
+        self.assertTrue(AuthVerifier().verify(f))
+        self.assertEqual(f.status, Status.VERIFIED)
+        self.assertEqual(f.verification["result"], "confirmed")
+        self.assertEqual(f.severity, Severity.HIGH)
+
+    def test_ssrf_canary_hit_confirmed(self):
+        f = self._finding("ssrf", {
+            "refused": False, "endpoint": "http://localhost:3000/api/rss-proxy",
+            "canary_received": True, "triggering_param": "url",
+            "response_status_by_param": {"url": 200}})
+        self.assertTrue(SsrfVerifier().verify(f))
+        self.assertEqual(f.status, Status.VERIFIED)
+        self.assertEqual(f.verification["result"], "confirmed")
+        self.assertEqual(f.severity, Severity.HIGH)
+
+    def test_ssrf_rejected_is_false_positive(self):
+        f = self._finding("ssrf", {
+            "refused": False, "endpoint": "http://localhost:3000/api/rss-proxy",
+            "canary_received": False, "response_status_by_param": {"url": 400}})
+        self.assertTrue(SsrfVerifier().verify(f))
+        self.assertEqual(f.status, Status.FALSE_POSITIVE)
+        self.assertEqual(f.verification["result"], "refuted")
+
+    def test_probe_verifiers_only_apply_to_their_tool(self):
+        cors = self._finding("cors", {"refused": False, "reachable": True})
+        self.assertTrue(CorsVerifier().applies_to(cors))
+        self.assertFalse(RateLimitVerifier().applies_to(cors))
+        self.assertFalse(AuthVerifier().applies_to(cors))
+        self.assertFalse(SsrfVerifier().applies_to(cors))
 
 
 class _Boom(Verifier):

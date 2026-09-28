@@ -17,6 +17,10 @@ from checks.security_headers import (
     REFERENCES as HEADER_REFERENCES,
     SECURITY_HEADERS,
 )
+from checks.cors import REFERENCES as CORS_REFERENCES
+from checks.rate_limit import REFERENCES as RATE_REFERENCES
+from checks.auth_mcp import REFERENCES as AUTH_REFERENCES
+from checks.ssrf import REFERENCES as SSRF_REFERENCES
 from model.finding import AssetKind, Finding, Severity, Status
 from engine.dedup import group_duplicates
 
@@ -28,6 +32,10 @@ _ID_PREFIX = {
     "npm-audit": "NPM",
     "zap": "ZAP",
     "nuclei": "NUC",
+    "cors": "CORS",
+    "rate-limit": "RATE",
+    "auth-mcp": "AUTH",
+    "ssrf": "SSRF",
 }
 
 _SEMGREP_SEVERITY = {
@@ -297,6 +305,10 @@ def normalize(
     npm_audit_result=None,
     zap_result=None,
     nuclei_result=None,
+    cors_result=None,
+    rate_limit_result=None,
+    auth_mcp_result=None,
+    ssrf_result=None,
     repo_path: Optional[str] = None,
 ) -> list[Finding]:
     """Normalize every collector's output into Findings, dedup-tag, and assign IDs."""
@@ -315,8 +327,183 @@ def normalize(
         findings.extend(normalize_zap(zap_result))
     if nuclei_result is not None:
         findings.extend(normalize_nuclei(nuclei_result))
+    if cors_result is not None:
+        findings.extend(normalize_cors(cors_result))
+    if rate_limit_result is not None:
+        findings.extend(normalize_rate_limit(rate_limit_result))
+    if auth_mcp_result is not None:
+        findings.extend(normalize_auth_mcp(auth_mcp_result))
+    if ssrf_result is not None:
+        findings.extend(normalize_ssrf(ssrf_result))
     group_duplicates(findings)
     assign_ids(findings)
+    return findings
+
+
+def _pending(probe_hint: str) -> dict:
+    """A verification stub for a raw active-probe observation (pending verification)."""
+    return {
+        "method": "none", "probe": None, "result": None,
+        "rationale": f"Raw {probe_hint} probe observation; pending active verification.",
+        "timestamp": _now(),
+    }
+
+
+def normalize_cors(result) -> list[Finding]:
+    """Map a CorsProbeResult into one suspected CORS finding (verdict assigned later)."""
+    if not result:
+        return []
+    ev = {
+        "url": result.url, "origin_sent": result.origin_sent,
+        "reachable": result.reachable, "refused": result.refused,
+        "status_code": result.status_code, "simple": result.simple,
+        "preflight_status": result.preflight_status, "preflight": result.preflight,
+        "probe_error": result.error, "timestamp": result.timestamp,
+    }
+    return [Finding(
+        tool="cors",
+        title="Cross-origin resource sharing (CORS) policy",
+        description=(
+            f"Active CORS probe sent the hostile Origin {result.origin_sent} (and an OPTIONS "
+            f"preflight) to {result.url}. The verdict is assigned by the CORS verifier from the "
+            "observed Access-Control-Allow-Origin/-Credentials headers, not from this observation."
+        ),
+        severity=Severity.INFO,
+        status=Status.SUSPECTED,
+        endpoint=result.url,
+        cwe="CWE-942",
+        evidence=ev,
+        asset={"kind": _endpoint_asset_kind(result.url), "ref": result.url, "weight": 1.0},
+        verification=_pending("CORS"),
+        references=list(CORS_REFERENCES),
+    )]
+
+
+def normalize_rate_limit(result) -> list[Finding]:
+    """Map a RateLimitProbeResult into one suspected rate-limit finding."""
+    if not result:
+        return []
+    ev = {
+        "url": result.url, "request_count": result.request_count,
+        "refused": result.refused, "reachable": result.reachable,
+        "statuses": result.statuses, "rate_limit_headers": result.rate_limit_headers,
+        "retry_after": result.retry_after, "saw_429": result.saw_429,
+        "timing_summary": result.timing_summary, "probe_error": result.error,
+        "timestamp": result.timestamp,
+    }
+    return [Finding(
+        tool="rate-limit",
+        title="Rate-limit enforcement",
+        description=(
+            f"Bounded rate-limit enforcement probe sent {result.request_count} paced request(s) "
+            f"to {result.url} and inspected for HTTP 429 / rate-limit headers. This is an "
+            "enforcement check, never a stress test; the verdict is assigned by the verifier."
+        ),
+        severity=Severity.INFO,
+        status=Status.SUSPECTED,
+        endpoint=result.url,
+        cwe="CWE-799",
+        evidence=ev,
+        asset={"kind": _endpoint_asset_kind(result.url), "ref": result.url, "weight": 1.0},
+        verification=_pending("rate-limit"),
+        references=list(RATE_REFERENCES),
+    )]
+
+
+def normalize_auth_mcp(result) -> list[Finding]:
+    """Map an AuthProbeResult into suspected auth/MCP findings (one per tested endpoint)."""
+    if not result:
+        return []
+    if getattr(result, "refused", False):
+        ev = {"refused": True, "target": result.target, "probe_error": result.error,
+              "timestamp": result.timestamp}
+        return [Finding(
+            tool="auth-mcp", title="Auth/MCP access control (probe refused)",
+            description="Active auth/MCP probe was refused because the target is not local.",
+            severity=Severity.INFO, status=Status.SUSPECTED, endpoint=result.target,
+            cwe="CWE-306", evidence=ev,
+            asset={"kind": AssetKind.API, "ref": result.target, "weight": 1.0},
+            verification=_pending("auth-MCP"), references=list(AUTH_REFERENCES))]
+    findings: list[Finding] = []
+    for obs in result.observations or []:
+        ev = dict(obs)
+        ev["refused"] = False
+        endpoint = obs.get("endpoint")
+        kind = obs.get("kind", "http")
+        asset_kind = AssetKind.MCP if kind == "mcp" else _endpoint_asset_kind(endpoint or "")
+        findings.append(Finding(
+            tool="auth-mcp",
+            title=f"Auth/MCP access control: {endpoint}",
+            description=(
+                f"Active probe requested {endpoint} unauthenticated and with invalid/malformed "
+                "credentials to check whether protected functionality is reachable without auth. "
+                "Only status codes and non-sensitive metadata are recorded; the verdict is "
+                "assigned by the verifier (a bare HTTP 200 is not treated as a weakness)."
+            ),
+            severity=Severity.INFO,
+            status=Status.SUSPECTED,
+            endpoint=endpoint,
+            cwe="CWE-306",
+            evidence=ev,
+            asset={"kind": asset_kind, "ref": endpoint, "weight": 1.0},
+            verification=_pending("auth-MCP"),
+            references=list(AUTH_REFERENCES),
+        ))
+    return findings
+
+
+def normalize_ssrf(result) -> list[Finding]:
+    """Map an SsrfProbeResult into suspected SSRF findings (one per tested endpoint)."""
+    if not result:
+        return []
+    if getattr(result, "refused", False):
+        ev = {"refused": True, "target": result.target, "probe_error": result.error,
+              "timestamp": result.timestamp}
+        return [Finding(
+            tool="ssrf", title="Server-side request forgery (probe refused)",
+            description="Active SSRF canary probe was refused because the target is not local.",
+            severity=Severity.INFO, status=Status.SUSPECTED, endpoint=result.target,
+            cwe="CWE-918", evidence=ev,
+            asset={"kind": AssetKind.API, "ref": result.target, "weight": 1.0},
+            verification=_pending("SSRF"), references=list(SSRF_REFERENCES))]
+    observations = result.observations or []
+    if not observations:
+        ev = {"refused": False, "target": result.target, "canary_bound": result.canary_bound,
+              "canary_token": result.canary_token, "canary_base": result.canary_base,
+              "response_status_by_param": {}, "canary_received": False,
+              "probe_error": result.error, "timestamp": result.timestamp}
+        return [Finding(
+            tool="ssrf", title="Server-side request forgery (no endpoint exercised)",
+            description=("Active SSRF canary probe ran but exercised no candidate endpoint "
+                         "(none reachable / canary unavailable); nothing was demonstrated."),
+            severity=Severity.INFO, status=Status.SUSPECTED, endpoint=result.target,
+            cwe="CWE-918", evidence=ev,
+            asset={"kind": AssetKind.API, "ref": result.target, "weight": 1.0},
+            verification=_pending("SSRF"), references=list(SSRF_REFERENCES))]
+    findings: list[Finding] = []
+    for obs in observations:
+        ev = dict(obs)
+        ev["refused"] = False
+        ev["canary_bound"] = result.canary_bound
+        endpoint = obs.get("endpoint")
+        findings.append(Finding(
+            tool="ssrf",
+            title=f"Server-side request forgery: {endpoint}",
+            description=(
+                f"Active SSRF probe fed a loopback canary URL ({obs.get('canary_base')}) to "
+                f"{endpoint} via {', '.join(obs.get('params_tested') or [])}. SSRF is confirmed "
+                "only if the canary actually received a request carrying our token; a URL echoed "
+                "in a client response proves nothing."
+            ),
+            severity=Severity.INFO,
+            status=Status.SUSPECTED,
+            endpoint=endpoint,
+            cwe="CWE-918",
+            evidence=ev,
+            asset={"kind": _endpoint_asset_kind(endpoint or ""), "ref": endpoint, "weight": 1.0},
+            verification=_pending("SSRF"),
+            references=list(SSRF_REFERENCES),
+        ))
     return findings
 
 

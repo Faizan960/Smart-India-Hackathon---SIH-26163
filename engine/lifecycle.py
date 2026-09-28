@@ -33,6 +33,33 @@ _ALLOWED = {
     Status.FALSE_POSITIVE: {Status.FALSE_POSITIVE},  # terminal
 }
 
+# A verification *result* is a distinct concept from a finding's lifecycle *status*.
+# A probe reports what it demonstrated; the lifecycle maps that onto a status. This is
+# the single source of truth for that mapping, so no probe can e.g. call a "refuted"
+# result "verified".
+CONFIRMED = "confirmed"
+REFUTED = "refuted"
+INCONCLUSIVE = "inconclusive"
+NOT_APPLICABLE = "not_applicable"
+VERIFICATION_RESULTS = (CONFIRMED, REFUTED, INCONCLUSIVE, NOT_APPLICABLE)
+
+# verification result -> the lifecycle status it produces.
+RESULT_TO_STATUS = {
+    CONFIRMED: Status.VERIFIED,              # the property was demonstrated
+    INCONCLUSIVE: Status.NEEDS_MANUAL_REVIEW,  # evidence insufficient either way
+    REFUTED: Status.FALSE_POSITIVE,          # evidence disproved the issue
+    NOT_APPLICABLE: Status.FALSE_POSITIVE,   # the issue cannot apply to this target
+}
+
+
+def status_for_result(result: str) -> str:
+    """Map a verification result to the lifecycle status it implies."""
+    if result not in RESULT_TO_STATUS:
+        raise ValueError(
+            f"Unknown verification result {result!r}; expected one of {VERIFICATION_RESULTS}")
+    return RESULT_TO_STATUS[result]
+
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -80,3 +107,19 @@ def transition(finding, new_status, *, actor, rationale, result=None,
         "timestamp": _now(),
     })
     return allowed
+
+
+def apply_verification(finding, *, result, actor, method, probe=None, rationale,
+                       evidence_updates=None) -> bool:
+    """Record a probe's verdict and move the finding to the mapped lifecycle status.
+
+    Verifiers call this rather than :func:`transition` directly, so the result->status
+    mapping is enforced in one place: a ``refuted`` / ``not_applicable`` result can only
+    ever produce ``false_positive``, and ``confirmed`` is the *only* path to ``verified``.
+    The verification result itself is always recorded on ``finding.verification['result']``,
+    even when the target status is terminal and the transition is refused.
+    """
+    new_status = status_for_result(result)
+    return transition(finding, new_status, actor=actor, rationale=rationale,
+                      result=result, method=method, probe=probe,
+                      evidence_updates=evidence_updates)

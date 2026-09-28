@@ -64,5 +64,54 @@ class TestLifecycle(unittest.TestCase):
         self.assertEqual(finding.status, Status.CORRELATED)
 
 
+class TestResultToStatusMapping(unittest.TestCase):
+    """PART 0: the verification result and the lifecycle status are separate concepts,
+    joined only by this fixed mapping. A probe can never bypass it."""
+
+    def test_status_for_result_mapping(self):
+        self.assertEqual(lifecycle.status_for_result(lifecycle.CONFIRMED), Status.VERIFIED)
+        self.assertEqual(lifecycle.status_for_result(lifecycle.INCONCLUSIVE),
+                         Status.NEEDS_MANUAL_REVIEW)
+        self.assertEqual(lifecycle.status_for_result(lifecycle.REFUTED), Status.FALSE_POSITIVE)
+        self.assertEqual(lifecycle.status_for_result(lifecycle.NOT_APPLICABLE),
+                         Status.FALSE_POSITIVE)
+
+    def test_unknown_result_rejected(self):
+        with self.assertRaises(ValueError):
+            lifecycle.status_for_result("definitely-not-a-result")
+
+    def test_confirmed_maps_to_verified(self):
+        finding = _finding()
+        self.assertTrue(lifecycle.apply_verification(
+            finding, result=lifecycle.CONFIRMED, actor="probe", method="active_probe",
+            probe="cors", rationale="demonstrated"))
+        self.assertEqual(finding.status, Status.VERIFIED)
+        self.assertEqual(finding.verification["result"], "confirmed")
+
+    def test_refuted_maps_to_false_positive_never_verified(self):
+        finding = _finding()
+        self.assertTrue(lifecycle.apply_verification(
+            finding, result=lifecycle.REFUTED, actor="probe", method="active_probe",
+            probe="security-headers", rationale="present"))
+        self.assertEqual(finding.status, Status.FALSE_POSITIVE)
+        self.assertEqual(finding.verification["result"], "refuted")
+
+    def test_not_applicable_maps_to_false_positive(self):
+        finding = _finding()
+        self.assertTrue(lifecycle.apply_verification(
+            finding, result=lifecycle.NOT_APPLICABLE, actor="probe", method="active_probe",
+            probe="security-headers", rationale="hsts on loopback http"))
+        self.assertEqual(finding.status, Status.FALSE_POSITIVE)
+        self.assertEqual(finding.verification["result"], "not_applicable")
+
+    def test_inconclusive_maps_to_needs_manual_review(self):
+        finding = _finding()
+        self.assertTrue(lifecycle.apply_verification(
+            finding, result=lifecycle.INCONCLUSIVE, actor="probe", method="active_probe",
+            probe="rate-limit", rationale="no signal in bounded sample"))
+        self.assertEqual(finding.status, Status.NEEDS_MANUAL_REVIEW)
+        self.assertEqual(finding.verification["result"], "inconclusive")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -57,10 +57,11 @@ class TestHeadersProbe(unittest.TestCase):
         return {f.evidence["header"]: f for f in findings}
 
     def test_present_header_is_informational(self):
+        # PART 0: a present header refutes the missing-header concern -> false_positive.
         findings = self._findings_for(dict(ALL_HEADERS))
         csp = findings["Content-Security-Policy"]
         self.assertEqual(csp.severity, Severity.INFO)
-        self.assertEqual(csp.status, Status.VERIFIED)
+        self.assertEqual(csp.status, Status.FALSE_POSITIVE)
         self.assertEqual(csp.verification["result"], "refuted")
         self.assertEqual(csp.evidence["verification_status"], "refuted")
 
@@ -74,10 +75,12 @@ class TestHeadersProbe(unittest.TestCase):
         self.assertIn("X-Frame-Options", xfo.evidence["remediation"])
 
     def test_missing_hsts_on_http_localhost_is_not_a_weakness(self):
+        # PART 0: HSTS is not_applicable on plain-HTTP loopback -> false_positive, not verified.
         headers = dict(ALL_HEADERS)
         del headers["Strict-Transport-Security"]
         hsts = self._findings_for(headers)["Strict-Transport-Security"]
         self.assertEqual(hsts.severity, Severity.INFO)
+        self.assertEqual(hsts.status, Status.FALSE_POSITIVE)
         self.assertEqual(hsts.verification["result"], "not_applicable")
 
     def test_case_insensitive_header_match(self):

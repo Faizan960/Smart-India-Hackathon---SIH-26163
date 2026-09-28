@@ -1,38 +1,57 @@
 #!/usr/bin/env python3
-"""WATCHTOWER - CLI orchestrator (Phase 3: correlation + verification).
+"""WATCHTOWER - CLI orchestrator (Phase 5: assessment intelligence & evidence).
 
 Pipeline stages:
-  [1] Init  [2] Semgrep  [3] Gitleaks  [4] OSV-Scanner  [5] npm audit
-  [6] Security headers  [7] OWASP ZAP  [8] Nuclei  [9] Normalize
-  [10] Correlate  [11] Verify  [12] Score  [13] Report
+  [1] Init  [2] Attack-surface discovery (static, read-only)
+  [3] Semgrep  [4] Gitleaks  [5] OSV-Scanner  [6] npm audit
+  [7] Security headers  [8] OWASP ZAP  [9] Nuclei
+  [10] CORS probe  [11] Rate-limit probe  [12] Auth/MCP probe  [13] SSRF canary probe
+  [14] Normalize  [15] Correlate  [16] Verify  [17] Score
+  [18] Assessment intelligence (link surface, evidence graph, explanations, confidence)
+  [19] Report (JSON + HTML + SARIF)
 
-Correlation raises confidence when independent tools agree (-> correlated); it never
-verifies. Verification runs safe, local-only verifiers that demonstrate a property
-against the live target or the local source tree, and is the ONLY stage that may mark a
-finding verified or false-positive. Scoring runs last so the WATCHTOWER Risk Score
-reflects each finding's final lifecycle status.
+Stage 2 discovers the target's attack surface statically (endpoints, RPC, MCP, auth
+boundaries, external integrations, secret-sensitive modules). Attack-surface entries are
+assessment TARGETS, not vulnerabilities. Stages 10-13 are active, controlled probes against
+the LOCAL target: they gather runtime evidence that the Verify stage later classifies.
+Correlation raises confidence when independent tools agree (-> correlated); it never verifies.
+Verification runs safe, local-only verifiers and is the ONLY stage that may mark a finding
+verified or false-positive. Scoring runs last so the WATCHTOWER Risk Score reflects each
+finding's final lifecycle status. Stage 18 links the static surface to the runtime findings,
+builds the evidence graph, and derives per-finding explanations and evidence confidence.
 
-Each collector stage is independently executable and records an honest execution status:
-a missing tool is 'skipped', a crash/parse error is 'failed', a real run is 'success'.
-Skips and failures are reported plainly, never disguised as clean results. Only the local
-repository and the local target are ever touched.
+Active probes refuse a non-local target by default (loopback only); a bounded request count,
+a loopback-only SSRF canary, and metadata-only response capture keep them non-abusive. Each
+stage records an honest execution status: a disabled/refused stage is 'skipped', a crash is
+'failed', a real run is 'success'. Only the local repository and the local target are touched.
 """
 from __future__ import annotations
 
 import argparse
+import json
+import platform
 import sys
 from collections import Counter
+from dataclasses import asdict
 from datetime import datetime, timezone
 
-from config import ConfigError, WATCHTOWER_VERSION, WatchtowerConfig
+from config import (ConfigError, PROBE_VERSIONS, SCANNER_TOOLS, WATCHTOWER_VERSION,
+                    WatchtowerConfig)
 from checks.security_headers import run_headers_probe
+from checks.cors import run_cors_probe
+from checks.rate_limit import run_rate_limit_probe
+from checks.auth_mcp import run_auth_probe
+from checks.ssrf import run_ssrf_probe
 from checks.verifiers import VerificationContext, run_verifiers
 from engine import correlator, normalizer, scorer
+from engine.attack_surface import discover_attack_surface
+from engine.diff import diff_reports
 from engine.evidence import EvidenceStore
 from engine.execution import ToolExecution
 from engine.git_meta import get_git_metadata
 from reports.html_report import write_html_report
 from reports.json_report import build_report, write_json_report
+from reports.sarif_report import write_sarif
 from scanners.semgrep import run_semgrep
 from scanners.gitleaks import run_gitleaks
 from scanners.osv import run_osv
@@ -40,7 +59,8 @@ from scanners.npm_audit import run_npm_audit
 from scanners.zap import run_zap
 from scanners.nuclei import run_nuclei
 
-TOTAL_STAGES = 13
+TOTAL_STAGES = 19
+_ACTIVE_PROBE_TOOLS = ("cors", "rate-limit", "auth-mcp", "ssrf")
 
 
 def _now_iso() -> str:
@@ -120,9 +140,97 @@ def _semgrep_raw(result):
         "executed": result.executed, "skipped": result.skipped, "error": result.error}
 
 
+def _probe_ok(tool, result) -> bool:
+    """True if an active probe actually gathered runtime evidence (else it 'failed')."""
+    if tool == "ssrf":
+        return bool(getattr(result, "canary_bound", False))
+    if tool == "auth-mcp":
+        return bool(getattr(result, "reachable", False) or getattr(result, "observations", None))
+    return bool(getattr(result, "reachable", False))
+
+
+def _probe_stage(tool, skip, locality_ok, runner, store, records):
+    """Run one active verification probe against the LOCAL target, honestly recorded.
+
+    A disabled probe or a non-local target is 'skipped' (never disguised as clean); a probe
+    that could not gather any evidence is 'failed'; a probe that ran is 'success'. The verdict
+    (confirmed/refuted/inconclusive/not_applicable) is decided later, in the Verify stage.
+    """
+    rec = ToolExecution(tool)
+    if skip:
+        rec.skip(f"Disabled via --skip-{tool} flag.")
+        _report_stage(rec)
+        records.append(rec)
+        return None
+    if not locality_ok:
+        rec.skip("Refused: active probe restricted to loopback targets "
+                 "(use --allow-nonlocal-active to override).")
+        _report_stage(rec)
+        records.append(rec)
+        return None
+    rec.start()
+    result = runner()
+    store.save_raw(f"{tool}_probe.json", asdict(result))
+    if getattr(result, "refused", False):
+        rec.skip(getattr(result, "error", None) or "Refused: non-local target.")
+    elif _probe_ok(tool, result):
+        rec.success()
+    else:
+        rec.failed(getattr(result, "error", None) or "Probe gathered no evidence.")
+    _report_stage(rec)
+    records.append(rec)
+    return result
+
+
 def _collector_raw(result):
     return result.raw or {
         "executed": result.executed, "skipped": result.skipped, "error": result.error}
+
+
+def _attack_surface_stage(config, store, records):
+    """Static, read-only attack-surface discovery (Phase 5). Never modifies the target."""
+    rec = ToolExecution("attack-surface")
+    if config.skip_attack_surface:
+        rec.skip("Disabled via --skip-attack-surface.")
+        _report_stage(rec)
+        records.append(rec)
+        return None
+    rec.start()
+    try:
+        surface = discover_attack_surface(config.repo_path)
+        store.save_raw("attack_surface.json", surface.to_dict())
+        rec.finding_count = len(surface.endpoints)
+        rec.success()
+        print(f"      discovered {len(surface.endpoints)} endpoint(s), "
+              f"{len(surface.security_modules)} security module(s), "
+              f"{len(surface.integrations)} integration(s) (targets, NOT vulnerabilities)")
+    except Exception as exc:                       # discovery must never abort the run
+        surface = None
+        rec.failed(f"attack-surface discovery failed: {exc}")
+    _report_stage(rec)
+    records.append(rec)
+    return surface
+
+
+def _reproducibility_manifest(config, store, git_meta) -> dict:
+    """Everything needed to reproduce this assessment (Phase 5, item 8)."""
+    return {
+        "assessment_id": store.run_id,
+        "timestamp": _now_iso(),
+        "target": config.normalized_target,
+        "repository": config.repo_path,
+        "commit": git_meta.get("commit"),
+        "branch": git_meta.get("branch"),
+        "git_available": git_meta.get("git_available"),
+        "watchtower_version": WATCHTOWER_VERSION,
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "probe_versions": dict(PROBE_VERSIONS),
+        "scanner_versions": {tool: None for tool in SCANNER_TOOLS},
+        "scanner_version_note": ("External scanner versions are not collected; WATCHTOWER does "
+                                 "not shell out purely for --version. See execution status."),
+        "configuration": config.config_manifest(),
+    }
 
 
 def run(config) -> int:
@@ -133,45 +241,84 @@ def run(config) -> int:
     git_meta = get_git_metadata(config.repo_path)
     print(f"      evidence: {store.run_dir}")
 
-    _stage(2, "Semgrep static scan")
+    _stage(2, "Attack-surface discovery (static, read-only)")
+    attack_surface = _attack_surface_stage(config, store, records)
+
+    _stage(3, "Semgrep static scan")
     semgrep_result = _collector_stage(
         "semgrep", config.skip_semgrep,
         lambda: run_semgrep(config.repo_path, timeout=config.semgrep_timeout),
         "semgrep.json", _semgrep_raw, store, records)
 
-    _stage(3, "Gitleaks secret scan")
+    _stage(4, "Gitleaks secret scan")
     gitleaks_result = _collector_stage(
         "gitleaks", config.skip_gitleaks,
         lambda: run_gitleaks(config.repo_path, timeout=config.gitleaks_timeout),
         "gitleaks.json", _collector_raw, store, records)
 
-    _stage(4, "OSV-Scanner dependency scan")
+    _stage(5, "OSV-Scanner dependency scan")
     osv_result = _collector_stage(
         "osv-scanner", config.skip_osv,
         lambda: run_osv(config.repo_path, timeout=config.osv_timeout),
         "osv.json", _collector_raw, store, records)
 
-    _stage(5, "npm audit dependency scan")
+    _stage(6, "npm audit dependency scan")
     npm_result = _collector_stage(
         "npm-audit", config.skip_npm_audit,
         lambda: run_npm_audit(config.repo_path, timeout=config.npm_audit_timeout),
         "npm_audit.json", _collector_raw, store, records)
 
-    _stage(6, "Security-headers probe")
+    _stage(7, "Security-headers probe")
     headers_result = _headers_stage(config, store, records)
 
-    _stage(7, "OWASP ZAP baseline (local target only)")
+    _stage(8, "OWASP ZAP baseline (local target only)")
     zap_result = _collector_stage(
         "zap", config.skip_zap,
         lambda: run_zap(config.normalized_target, timeout=config.zap_timeout),
         "zap.json", _collector_raw, store, records)
 
-    _stage(8, "Nuclei controlled scan (local target only)")
+    _stage(9, "Nuclei controlled scan (local target only)")
     nuclei_result = _collector_stage(
         "nuclei", config.skip_nuclei,
         lambda: run_nuclei(config.normalized_target, timeout=config.nuclei_timeout),
         "nuclei.jsonl", _collector_raw, store, records)
-    _stage(9, "Normalizing findings")
+
+    local_ok = config.target_is_local or config.allow_nonlocal_active
+    if not local_ok:
+        print("      NOTE: target is non-local; active probes (CORS/rate-limit/auth-MCP/SSRF) "
+              "are refused unless --allow-nonlocal-active is set.")
+
+    _stage(10, "CORS probe (active, local target only)")
+    cors_result = _probe_stage(
+        "cors", config.skip_cors, local_ok,
+        lambda: run_cors_probe(config.normalized_target, timeout=config.request_timeout,
+                               allow_nonlocal=config.allow_nonlocal_active),
+        store, records)
+
+    _stage(11, "Rate-limit enforcement probe (bounded, non-abusive)")
+    rate_limit_result = _probe_stage(
+        "rate-limit", config.skip_rate_limit, local_ok,
+        lambda: run_rate_limit_probe(config.normalized_target, count=config.rate_limit_count,
+                                     timeout=config.request_timeout,
+                                     allow_nonlocal=config.allow_nonlocal_active),
+        store, records)
+
+    _stage(12, "Auth/MCP access-control probe (no credential guessing)")
+    auth_result = _probe_stage(
+        "auth-mcp", config.skip_auth_mcp, local_ok,
+        lambda: run_auth_probe(config.normalized_target, timeout=config.request_timeout,
+                               allow_nonlocal=config.allow_nonlocal_active),
+        store, records)
+
+    _stage(13, "SSRF local-canary probe (loopback canary only)")
+    ssrf_result = _probe_stage(
+        "ssrf", config.skip_ssrf, local_ok,
+        lambda: run_ssrf_probe(config.normalized_target, canary_port=config.canary_port,
+                               timeout=config.request_timeout,
+                               allow_nonlocal=config.allow_nonlocal_active),
+        store, records)
+
+    _stage(14, "Normalizing findings")
     findings = normalizer.normalize(
         semgrep_result=semgrep_result,
         gitleaks_result=gitleaks_result,
@@ -180,6 +327,10 @@ def run(config) -> int:
         headers_result=headers_result,
         zap_result=zap_result,
         nuclei_result=nuclei_result,
+        cors_result=cors_result,
+        rate_limit_result=rate_limit_result,
+        auth_mcp_result=auth_result,
+        ssrf_result=ssrf_result,
         repo_path=config.repo_path,
     )
     counts = Counter(f.tool for f in findings)
@@ -187,11 +338,11 @@ def run(config) -> int:
         rec.finding_count = counts.get(rec.tool, 0)
     print(f"      normalized {len(findings)} finding(s)")
 
-    _stage(10, "Correlating findings across tools")
+    _stage(15, "Correlating findings across tools")
     correlation = correlator.correlate(findings)
     print(f"      {len(correlation)} correlation group(s) (cross-tool corroboration -> correlated)")
 
-    _stage(11, "Verifying findings (safe, local-only probes)")
+    _stage(16, "Verifying findings (safe, local-only probes)")
     context = VerificationContext.build(
         repo_path=config.repo_path, target_url=config.normalized_target)
     verify_counts = run_verifiers(findings, context)
@@ -199,37 +350,72 @@ def run(config) -> int:
     print(f"      {applied} verification transition(s): "
           + ", ".join(f"{name}={n}" for name, n in verify_counts.items()))
 
-    _stage(12, "Calculating WATCHTOWER Risk Scores")
+    _stage(17, "Calculating WATCHTOWER Risk Scores")
     scorer.score_all(findings)
 
-    _stage(13, "Generating reports")
+    _stage(18, "Assessment intelligence (evidence graph, explanations, confidence)")
+    environment = _reproducibility_manifest(config, store, git_meta)
+    print(f"      assessment id: {environment['assessment_id']} · "
+          f"python {environment['python_version']} · watchtower {WATCHTOWER_VERSION}")
+
+    _stage(19, "Generating reports (JSON + HTML + SARIF)")
     scan = {
-        "timestamp": _now_iso(),
+        "timestamp": environment["timestamp"],
         "target": config.normalized_target,
         "repository": config.repo_path,
         "commit": git_meta.get("commit"),
         "branch": git_meta.get("branch"),
     }
     execution = [rec.to_dict() for rec in records]
-    report = build_report(findings, scan, WATCHTOWER_VERSION, execution=execution)
+    report = build_report(findings, scan, WATCHTOWER_VERSION, execution=execution,
+                          attack_surface=attack_surface, environment=environment,
+                          assessment_id=store.run_id)
     store.save_findings(findings)
     store.save_metadata({
         "scan": scan,
         "execution": execution,
         "git": git_meta,
         "watchtower_version": WATCHTOWER_VERSION,
+        "reproducibility": environment,
         "analysis": {
+            "attack_surface_summary": (report["attack_surface"].get("summary")
+                                       if report.get("attack_surface") else None),
             "correlation_groups": correlation,
             "verification_transitions": verify_counts,
+            "assessment_limitations": report.get("assessment_limitations"),
         },
     })
     json_path = write_json_report(store.path("report.json"), report)
     html_path = write_html_report(store.path("report.html"), report)
-    print(f"      json: {json_path}")
-    print(f"      html: {html_path}")
+    sarif_path = write_sarif(store.path("report.sarif"), report)
+    print(f"      json:  {json_path}")
+    print(f"      html:  {html_path}")
+    print(f"      sarif: {sarif_path}")
+
+    if config.diff_against:
+        _write_diff(config.diff_against, report, store)
 
     _print_summary(report, records, store)
     return 0
+
+
+def _write_diff(baseline_path: str, report: dict, store) -> None:
+    """Compare this report to a prior report.json and persist the observed diff."""
+    try:
+        with open(baseline_path, "r", encoding="utf-8") as handle:
+            baseline = json.load(handle)
+    except (OSError, ValueError) as exc:
+        print(f"      diff: SKIPPED - could not read baseline {baseline_path!r}: {exc}")
+        return
+    diff = diff_reports(baseline, report)
+    path = store.path("report.diff.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(diff, handle, indent=2, ensure_ascii=False)
+    c = diff["counts"]
+    print(f"      diff:  {path}")
+    print(f"      diff vs baseline: new={c['new']} resolved={c['resolved']} "
+          f"status_changed={c['status_changed']} surface_added={c['surface_added']} "
+          f"surface_removed={c['surface_removed']} (causality NOT inferred)")
 
 
 def _print_summary(report, records, store) -> None:
@@ -247,6 +433,33 @@ def _print_summary(report, records, store) -> None:
         f"verified={summary['verified']} needs_review={summary['needs_manual_review']} "
         f"false_positive={summary['false_positive']}"
     )
+    vr = summary.get("verification_results") or {}
+    if vr:
+        print(
+            f"  verification results: confirmed={vr.get('confirmed', 0)} "
+            f"refuted={vr.get('refuted', 0)} inconclusive={vr.get('inconclusive', 0)} "
+            f"not_applicable={vr.get('not_applicable', 0)}"
+        )
+    conf = summary.get("evidence_confidence") or {}
+    if conf:
+        print(f"  evidence confidence: high={conf.get('high', 0)} "
+              f"medium={conf.get('medium', 0)} low={conf.get('low', 0)} "
+              "(evidence completeness - NOT severity, score, or lifecycle status)")
+    asf = report.get("attack_surface") or {}
+    asf_summary = asf.get("summary") or {}
+    if asf_summary.get("endpoint_count"):
+        print(f"  attack surface: {asf_summary.get('endpoint_count', 0)} endpoint(s), "
+              f"{asf_summary.get('security_module_count', 0)} security module(s), "
+              f"{asf_summary.get('integration_count', 0)} integration(s) "
+              "(assessment targets, NOT vulnerabilities)")
+    active_recs = [rec for rec in records if rec.tool in _ACTIVE_PROBE_TOOLS]
+    if active_recs:
+        ran = sum(1 for rec in active_recs if rec.status == "success")
+        print(
+            f"  active probes: {ran}/{len(active_recs)} ran "
+            f"({summary.get('active_probe_findings', 0)} finding(s)) - "
+            + ", ".join(f"{rec.tool}={rec.status}" for rec in active_recs)
+        )
     for rec in records:
         line = f"  {rec.tool}: {rec.status} ({rec.finding_count} finding(s), {rec.duration_seconds}s)"
         if rec.error:
@@ -257,22 +470,35 @@ def _print_summary(report, records, store) -> None:
         print(f"  duplicate groups: {len(dup)} (same vuln reported by multiple tools)")
     cor = report.get("correlation_groups") or []
     if cor:
-        print(f"  correlation groups: {len(cor)} (independent tools corroborate -> correlated)")
+        print(f"  correlation groups (count): {len(cor)}; "
+              f"findings currently correlated: {summary.get('findings_currently_correlated', 0)} "
+              "(a group is a cluster of corroborating findings; 'currently correlated' counts "
+              "findings whose lifecycle status is still correlated - the two differ once verified)")
     skipped = summary.get("scanners_skipped") or []
     if skipped:
         print(f"  scanners skipped: {', '.join(skipped)}")
+    limitations = report.get("assessment_limitations") or {}
+    untested = limitations.get("untested_attack_paths") or []
+    if untested:
+        print(f"  untested attack paths: {len(untested)} tagged endpoint(s) not exercised "
+              "by any probe (static candidates only)")
+    unavailable = limitations.get("unavailable_runtime_surfaces") or []
+    if unavailable:
+        print(f"  unavailable runtime surfaces: {len(unavailable)} endpoint(s) responded only "
+              "under the dev runtime; production/serverless surface not exercised")
     if any(rec.status == "failed" for rec in records):
         print("  NOTE: one or more tools failed; findings are incomplete (see above).")
     if all(rec.status != "success" for rec in records):
         print("  NOTE: no tool produced results; this is not a claim that the target is safe.")
     print("  NOTE: 'verified' means a probe demonstrated the property; correlation is not verification.")
+    print("  NOTE: attack-surface entries are assessment targets, not vulnerabilities.")
     print(f"  artefacts: {store.run_dir}")
 
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="watchtower",
-        description="WATCHTOWER - automated security assessment (Phase 3: correlation + verification).",
+        description="WATCHTOWER - automated security assessment (Phase 5: assessment intelligence).",
     )
     parser.add_argument("--repo", required=True, help="Path to the target repository (never modified).")
     parser.add_argument("--target", required=True, help="Base URL of the running target, e.g. http://localhost:3000")
@@ -285,12 +511,28 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--zap-timeout", type=int, default=900, help="ZAP baseline timeout in seconds.")
     parser.add_argument("--nuclei-timeout", type=int, default=600, help="Nuclei timeout in seconds.")
     parser.add_argument("--skip-semgrep", action="store_true", help="Skip the Semgrep scan stage.")
+    parser.add_argument("--skip-attack-surface", action="store_true",
+                        help="Skip static attack-surface discovery (Phase 5).")
+    parser.add_argument("--diff-against", default=None,
+                        help="Path to a prior report.json to diff this run against (read-only).")
     parser.add_argument("--skip-gitleaks", action="store_true", help="Skip the Gitleaks stage.")
     parser.add_argument("--skip-osv", action="store_true", help="Skip the OSV-Scanner stage.")
     parser.add_argument("--skip-npm-audit", action="store_true", help="Skip the npm audit stage.")
     parser.add_argument("--skip-headers", action="store_true", help="Skip the security-headers probe.")
     parser.add_argument("--skip-zap", action="store_true", help="Skip the OWASP ZAP stage.")
     parser.add_argument("--skip-nuclei", action="store_true", help="Skip the Nuclei stage.")
+    # Phase 4 - active verification probes (local target only by default).
+    parser.add_argument("--skip-cors", action="store_true", help="Skip the CORS active probe.")
+    parser.add_argument("--skip-rate-limit", action="store_true", help="Skip the rate-limit enforcement probe.")
+    parser.add_argument("--skip-auth-mcp", action="store_true", help="Skip the auth/MCP access-control probe.")
+    parser.add_argument("--skip-ssrf", action="store_true", help="Skip the SSRF local-canary probe.")
+    parser.add_argument("--rate-limit-count", type=int, default=10,
+                        help="Bounded request count for the rate-limit probe (1-25, default 10).")
+    parser.add_argument("--canary-port", type=int, default=9001,
+                        help="Loopback port for the SSRF canary listener (default 9001).")
+    parser.add_argument("--allow-nonlocal-active", action="store_true",
+                        help="Explicitly permit active probes against a non-loopback target "
+                             "(off by default; active probes refuse non-local targets).")
     return parser.parse_args(argv)
 
 
@@ -315,6 +557,15 @@ def main(argv=None) -> int:
             skip_npm_audit=args.skip_npm_audit,
             skip_zap=args.skip_zap,
             skip_nuclei=args.skip_nuclei,
+            skip_attack_surface=args.skip_attack_surface,
+            skip_cors=args.skip_cors,
+            skip_rate_limit=args.skip_rate_limit,
+            skip_auth_mcp=args.skip_auth_mcp,
+            skip_ssrf=args.skip_ssrf,
+            rate_limit_count=args.rate_limit_count,
+            canary_port=args.canary_port,
+            allow_nonlocal_active=args.allow_nonlocal_active,
+            diff_against=args.diff_against,
         ).validate()
     except ConfigError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -11,11 +11,15 @@ from engine import explainer
 from engine.attack_surface import link_findings
 from engine.correlator import correlation_groups
 from engine.dedup import duplicate_groups
+from engine.diff import diff_reports
 from engine.evidence_graph import build_evidence_graph
+from engine.gate import evaluate_gate
 from engine.lifecycle import CONFIRMED, INCONCLUSIVE, NOT_APPLICABLE, REFUTED
 from model.finding import Severity, Status
 
-SCHEMA_VERSION = "1.1"
+# Schema 1.2 (Phase 6): additive — same 1.1 fields, plus structured "diff" and "gate"
+# sections. No 1.1 field was renamed or removed, so 1.1 consumers keep working.
+SCHEMA_VERSION = "1.2"
 
 # Tools whose findings come from Phase-4 active verification probes (kept distinct from
 # the passive scanners so the report never conflates "a scanner ran" with "a probe verified").
@@ -157,13 +161,21 @@ def _enrich_findings(findings, graph, reverse_links) -> list:
 
 def build_report(findings, scan: dict, watchtower_version: str, execution: list | None = None,
                  attack_surface=None, environment: dict | None = None,
-                 assessment_id: str | None = None) -> dict:
+                 assessment_id: str | None = None, baseline: dict | None = None) -> dict:
     """Build the report dict. `findings` are Finding objects; output holds plain dicts.
 
     `execution` is the list of per-tool ToolExecution records (as dicts). `attack_surface`
     is an AttackSurface (Phase 5) whose endpoints are linked to findings. Duplicate groups
     are the same advisory reported by multiple tools; correlation groups are independent
     tools corroborating the same underlying issue (which raises confidence, not verification).
+
+    `baseline` is an optional prior assessment (a report.json OR a canonical baseline; both
+    shapes are accepted by engine.diff). When supplied, the report embeds the structured
+    ``diff`` (engine.diff.diff_reports(baseline, report), reused verbatim) and a
+    baseline-aware ``gate``. When it is None, ``diff`` is null — NOT an empty diff, because
+    "no baseline" is not "no changes" — and the gate still evaluates the current findings
+    with ``baseline_aware`` false. The embedded ``gate`` is always engine.gate.evaluate_gate
+    run against this very report, so report["gate"] cannot drift from the gate engine.
     """
     summary = _summary(findings)
     summary.update(_execution_metrics(execution))
@@ -178,7 +190,7 @@ def build_report(findings, scan: dict, watchtower_version: str, execution: list 
     graph = build_evidence_graph(findings, endpoint_dicts, reverse_links, correlation)
     limitations = _assessment_limitations(findings, surface_dict, execution)
 
-    return {
+    report = {
         "schema_version": SCHEMA_VERSION,
         "watchtower_version": watchtower_version,
         "assessment": {"id": assessment_id, "timestamp": scan.get("timestamp"),
@@ -197,6 +209,13 @@ def build_report(findings, scan: dict, watchtower_version: str, execution: list 
         "evidence_graph": graph.to_dict(),
         "findings": _enrich_findings(findings, graph, reverse_links),
     }
+
+    # Phase-6 additive sections. Compute from the assembled report so both stay consistent
+    # with their engines; diff_reports/evaluate_gate ignore the very keys we are adding.
+    diff = diff_reports(baseline, report) if baseline is not None else None
+    report["diff"] = diff
+    report["gate"] = evaluate_gate(report, diff)
+    return report
 
 
 def write_json_report(path: str, report: dict) -> str:

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import sys
 from collections import Counter
@@ -45,7 +46,9 @@ from checks.ssrf import run_ssrf_probe
 from checks.verifiers import VerificationContext, run_verifiers
 from engine import correlator, normalizer, scorer
 from engine.attack_surface import discover_attack_surface
+from engine.baseline import build_baseline, load_baseline, render_summary, save_baseline
 from engine.diff import diff_reports
+from engine.gate import evaluate_gate, exit_code_for, render_gate
 from engine.evidence import EvidenceStore
 from engine.execution import ToolExecution
 from engine.git_meta import get_git_metadata
@@ -367,9 +370,12 @@ def run(config) -> int:
         "branch": git_meta.get("branch"),
     }
     execution = [rec.to_dict() for rec in records]
+    # Load the prior assessment (if any) BEFORE building the report so the structured diff
+    # and a baseline-aware gate can be embedded directly into report.json (schema 1.2).
+    baseline = _load_baseline_for_diff(config.diff_against) if config.diff_against else None
     report = build_report(findings, scan, WATCHTOWER_VERSION, execution=execution,
                           attack_surface=attack_surface, environment=environment,
-                          assessment_id=store.run_id)
+                          assessment_id=store.run_id, baseline=baseline)
     store.save_findings(findings)
     store.save_metadata({
         "scan": scan,
@@ -392,22 +398,34 @@ def run(config) -> int:
     print(f"      html:  {html_path}")
     print(f"      sarif: {sarif_path}")
 
-    if config.diff_against:
-        _write_diff(config.diff_against, report, store)
+    if report.get("diff") is not None:
+        _write_diff_artifact(report["diff"], store)
+    _print_gate(report["gate"])
 
     _print_summary(report, records, store)
     return 0
 
 
-def _write_diff(baseline_path: str, report: dict, store) -> None:
-    """Compare this report to a prior report.json and persist the observed diff."""
+def _load_baseline_for_diff(baseline_path: str):
+    """Load a prior report.json / baseline.json to diff against, or None on failure.
+
+    File I/O (CLI-only concern) lives here; the structured diff itself is produced inside
+    build_report via engine.diff, so this never duplicates diff logic.
+    """
     try:
         with open(baseline_path, "r", encoding="utf-8") as handle:
-            baseline = json.load(handle)
+            return json.load(handle)
     except (OSError, ValueError) as exc:
         print(f"      diff: SKIPPED - could not read baseline {baseline_path!r}: {exc}")
-        return
-    diff = diff_reports(baseline, report)
+        return None
+
+
+def _write_diff_artifact(diff: dict, store) -> None:
+    """Persist the already-computed structured diff (from report['diff']) to report.diff.json.
+
+    The diff is NOT recomputed here — it is the exact object embedded in report.json, so the
+    standalone artefact and the in-report section can never disagree.
+    """
     path = store.path("report.diff.json")
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(diff, handle, indent=2, ensure_ascii=False)
@@ -416,6 +434,12 @@ def _write_diff(baseline_path: str, report: dict, store) -> None:
     print(f"      diff vs baseline: new={c['new']} resolved={c['resolved']} "
           f"status_changed={c['status_changed']} surface_added={c['surface_added']} "
           f"surface_removed={c['surface_removed']} (causality NOT inferred)")
+
+
+def _print_gate(gate: dict) -> None:
+    """Print the embedded structured gate result (report['gate']) for console visibility."""
+    for line in render_gate(gate):
+        print(f"      {line.strip()}" if line.startswith("gate result") else f"        {line.strip()}")
 
 
 def _print_summary(report, records, store) -> None:
@@ -536,7 +560,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv=None) -> int:
+def _assess_main(argv) -> int:
+    """The original flat assessment CLI, unchanged: `watchtower --repo ... --target ...`."""
     args = parse_args(argv)
     try:
         config = WatchtowerConfig(
@@ -575,6 +600,118 @@ def main(argv=None) -> int:
     except Exception as exc:  # last resort: never crash without a clear message
         print(f"ERROR: unexpected failure: {exc}", file=sys.stderr)
         return 1
+
+
+def _baseline_main(argv) -> int:
+    """`watchtower baseline save|show` — Phase-6 canonical baseline commands."""
+    parser = argparse.ArgumentParser(
+        prog="watchtower baseline",
+        description="Canonical assessment baseline: save one from a report, or show a saved one.")
+    sub = parser.add_subparsers(dest="action", required=True)
+    p_save = sub.add_parser("save", help="Build a deterministic baseline from a report.json.")
+    p_save.add_argument("--from-report", required=True,
+                        help="Path to a WATCHTOWER report.json to derive the baseline from.")
+    p_save.add_argument("--out", default=None,
+                        help="Output path (default: baseline.json beside the report).")
+    p_show = sub.add_parser("show", help="Print a summary of a saved baseline.")
+    p_show.add_argument("path", help="Path to a saved baseline.json.")
+    p_show.add_argument("--json", action="store_true", help="Print the raw baseline JSON instead.")
+    args = parser.parse_args(argv)
+    return _baseline_save(args) if args.action == "save" else _baseline_show(args)
+
+
+def _baseline_save(args) -> int:
+    try:
+        with open(args.from_report, "r", encoding="utf-8") as handle:
+            report = json.load(handle)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: cannot read report {args.from_report!r}: {exc}", file=sys.stderr)
+        return 2
+    baseline = build_baseline(report)
+    out = args.out or os.path.join(
+        os.path.dirname(os.path.abspath(args.from_report)) or ".", "baseline.json")
+    try:
+        save_baseline(out, baseline)
+    except OSError as exc:
+        print(f"ERROR: cannot write baseline {out!r}: {exc}", file=sys.stderr)
+        return 2
+    print(f"WATCHTOWER baseline saved: {out}")
+    for line in render_summary(baseline):
+        print(f"  {line}")
+    return 0
+
+
+def _baseline_show(args) -> int:
+    try:
+        baseline = load_baseline(args.path)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: cannot read baseline {args.path!r}: {exc}", file=sys.stderr)
+        return 2
+    if getattr(args, "json", False):
+        print(json.dumps(baseline, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    print("WATCHTOWER baseline")
+    for line in render_summary(baseline):
+        print(f"  {line}")
+    return 0
+
+
+def _gate_main(argv) -> int:
+    """`watchtower gate --report ... [--baseline ...]` — Phase-6 security gate.
+
+    Evaluates the deterministic ``watchtower-gate-v1`` policy over structured report data
+    only. With ``--baseline`` it also detects newly verified findings via the structured
+    diff. Exit: 0 = PASS or WARN, 1 = FAIL (security gate failure), 2 = read/parse error.
+    """
+    parser = argparse.ArgumentParser(
+        prog="watchtower gate",
+        description="Evaluate the deterministic security gate over a structured report.")
+    parser.add_argument("--report", required=True,
+                        help="Path to a WATCHTOWER report.json to evaluate.")
+    parser.add_argument("--baseline", default=None,
+                        help="Optional canonical baseline.json; enables newly-verified detection.")
+    parser.add_argument("--json", action="store_true", help="Print the raw gate JSON result.")
+    args = parser.parse_args(argv)
+
+    try:
+        with open(args.report, "r", encoding="utf-8") as handle:
+            report = json.load(handle)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: cannot read report {args.report!r}: {exc}", file=sys.stderr)
+        return 2
+
+    diff = None
+    if args.baseline is not None:
+        try:
+            with open(args.baseline, "r", encoding="utf-8") as handle:
+                baseline = json.load(handle)
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: cannot read baseline {args.baseline!r}: {exc}", file=sys.stderr)
+            return 2
+        diff = diff_reports(baseline, report)
+
+    gate = evaluate_gate(report, diff)
+    if getattr(args, "json", False):
+        print(json.dumps(gate, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        for line in render_gate(gate):
+            print(line)
+    return exit_code_for(gate["result"])
+
+
+def main(argv=None) -> int:
+    """Dispatch: a recognised subcommand routes to it; anything else is the assess CLI.
+
+    Peeking at argv[0] keeps the original flat `watchtower --repo ... --target ...` invocation
+    byte-for-byte unchanged (no subparser wraps it), while `watchtower baseline ...` and
+    `watchtower gate ...` route to their Phase-6 commands.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "baseline":
+        return _baseline_main(argv[1:])
+    if argv and argv[0] == "gate":
+        return _gate_main(argv[1:])
+    return _assess_main(argv)
 
 
 if __name__ == "__main__":

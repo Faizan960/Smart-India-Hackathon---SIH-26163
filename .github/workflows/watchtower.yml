@@ -1,0 +1,87 @@
+# WATCHTOWER — continuous security assessment & regression gate (Phase 6, STEP 6).
+#
+# Honest scope: the hosted runner has no running World Monitor target and none of the
+# external scanners installed, so this workflow exercises the *mechanism* end-to-end
+# against WATCHTOWER's own repository (read-only, non-destructive) and wires the
+# security gate's exit code in as a required status check. It never scans external
+# infrastructure and never fabricates a live-target result — stages with no tool or no
+# target are honestly skipped, and the gate reports that as a coverage limitation.
+#
+# To gate a real target, run the assessment where the app is reachable and pass a stored
+# baseline, e.g.:
+#   python watchtower.py --repo <path> --target http://localhost:3000 --diff-against baseline.json
+#   python watchtower.py gate --report <report.json> --baseline baseline.json
+name: WATCHTOWER
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly posture snapshot (Mondays 06:00 UTC).
+    - cron: "0 6 * * 1"
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: watchtower-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test suite (engines + gate + diff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          allow-prereleases: true
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+      - name: Whitespace / conflict-marker hygiene
+        run: git diff --check
+      - name: Unit + engine test suite
+        run: python -m unittest discover -s tests -v
+
+  security-gate:
+    name: Security regression gate
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          allow-prereleases: true
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+      # Read-only self-assessment. External scanners are not installed on the runner and
+      # no target app is served here, so every network/tool stage is skipped explicitly;
+      # the static attack-surface discovery still runs against the checked-out source.
+      - name: Static self-assessment (read-only; no live target on the runner)
+        run: >
+          python watchtower.py
+          --repo .
+          --target http://localhost:3000
+          --output ./output/ci
+          --skip-semgrep --skip-gitleaks --skip-osv --skip-npm-audit
+          --skip-headers --skip-zap --skip-nuclei
+          --skip-cors --skip-rate-limit --skip-auth-mcp --skip-ssrf
+      - name: Locate the generated report
+        id: report
+        run: echo "path=$(ls -d ./output/ci/run-*/report.json | head -n1)" >> "$GITHUB_OUTPUT"
+      # The gate's exit code is the status check: FAIL (verified critical/high or a new
+      # verified finding vs a baseline) -> non-zero -> the build fails. PASS/WARN -> 0.
+      - name: Security regression gate
+        run: python watchtower.py gate --report "${{ steps.report.outputs.path }}"
+      - name: Upload assessment artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watchtower-assessment
+          path: ./output/ci/run-*/report.*
+          if-no-files-found: error
